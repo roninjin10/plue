@@ -27,14 +27,15 @@ pub const Repository = struct {
 // =============================================================================
 
 pub fn getByUserAndName(pool: *Pool, username: []const u8, repo_name: []const u8) !?Repository {
-    const row = try pool.row(
+    var row = try pool.row(
         \\SELECT r.id, r.user_id, r.name, r.description, r.is_public, r.default_branch
         \\FROM repositories r
         \\JOIN users u ON r.user_id = u.id
         \\WHERE u.username = $1 AND r.name = $2
     , .{ username, repo_name });
 
-    if (row) |r| {
+    if (row) |*r| {
+        defer r.deinit() catch {};
         return Repository{
             .id = r.get(i64, 0),
             .user_id = r.get(i64, 1),
@@ -48,12 +49,13 @@ pub fn getByUserAndName(pool: *Pool, username: []const u8, repo_name: []const u8
 }
 
 pub fn getById(pool: *Pool, repo_id: i64) !?Repository {
-    const row = try pool.row(
+    var row = try pool.row(
         \\SELECT id, user_id, name, description, is_public, default_branch
         \\FROM repositories WHERE id = $1
     , .{repo_id});
 
-    if (row) |r| {
+    if (row) |*r| {
+        defer r.deinit() catch {};
         return Repository{
             .id = r.get(i64, 0),
             .user_id = r.get(i64, 1),
@@ -67,11 +69,15 @@ pub fn getById(pool: *Pool, repo_id: i64) !?Repository {
 }
 
 pub fn exists(pool: *Pool, owner_id: i64, name: []const u8) !bool {
-    const row = try pool.row(
+    var row = try pool.row(
         \\SELECT 1 FROM repositories WHERE user_id = $1 AND name = $2
     , .{ owner_id, name });
 
-    return row != null;
+    if (row) |*r| {
+        defer r.deinit() catch {};
+        return true;
+    }
+    return false;
 }
 
 // =============================================================================
@@ -85,11 +91,12 @@ pub fn create(
     description: ?[]const u8,
     is_public: bool,
 ) !i64 {
-    const row = try pool.row(
+    var row = try pool.row(
         \\INSERT INTO repositories (user_id, name, description, is_public, created_at, updated_at)
         \\VALUES ($1, $2, $3, $4, NOW(), NOW())
         \\RETURNING id
     , .{ owner_id, name, description, is_public }) orelse return error.InsertFailed;
+    defer row.deinit() catch {};
 
     return row.get(i64, 0);
 }
@@ -123,13 +130,14 @@ pub fn delete(pool: *Pool, repo_id: i64) !void {
 
 /// Get repository ID by username and repository name (case-insensitive)
 pub fn getId(pool: *Pool, username: []const u8, repo_name: []const u8) !?i64 {
-    const row = try pool.row(
+    var row = try pool.row(
         \\SELECT r.id FROM repositories r
         \\JOIN users u ON r.user_id = u.id
         \\WHERE u.lower_username = lower($1) AND lower(r.name) = lower($2)
     , .{ username, repo_name });
 
-    if (row) |r| {
+    if (row) |*r| {
+        defer r.deinit() catch {};
         return r.get(i64, 0);
     }
     return null;
