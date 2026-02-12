@@ -66,21 +66,26 @@ pub const ConnectionManager = struct {
         }
     };
 
-    /// A single WebSocket connection reference (non-owning)
-    const WsRef = struct {
+    /// Per-connection node stored on the heap to ensure a stable address.
+    /// Lifetime is guarded by `use_count` so writers can safely release the
+    /// manager lock while holding a temporary reference.
+    const ConnRef = struct {
         conn: *websocket.Conn,
+        write_mutex: std.Thread.Mutex = .{},
+        use_count: usize = 0,
+        closed: bool = false,
     };
 
-    /// Per-session list of WebSocket connections
+    /// Per-session list of WebSocket connections (non-owning Conn.conn)
     const WsList = struct {
-        items: std.ArrayListUnmanaged(WsRef) = .{},
+        items: std.ArrayListUnmanaged(*ConnRef) = .{},
 
         fn init() WsList {
             return .{ .items = .{} };
         }
 
         fn deinit(self: *WsList, allocator: std.mem.Allocator) void {
-            // we don't own the conn pointers; just free the list using the manager allocator
+            for (self.items.items) |ptr| allocator.destroy(ptr);
             self.items.deinit(allocator);
         }
     };
@@ -100,10 +105,7 @@ pub const ConnectionManager = struct {
         defer self.mutex.unlock();
 
         var key_it = self.abort_flags.keyIterator();
-        while (key_it.next()) |key| {
-            self.allocator.free(key.*);
-        }
-
+        while (key_it.next()) |key| self.allocator.free(key.*);
         self.abort_flags.deinit();
 
         // Free session IDs and their queues
@@ -116,7 +118,7 @@ pub const ConnectionManager = struct {
         }
         self.event_queues.deinit();
 
-        // Free session IDs in ws_conns (connection objects owned elsewhere)
+        // Free session IDs and any heap-allocated ConnRef nodes
         var ws_it = self.ws_conns.iterator();
         while (ws_it.next()) |entry| {
             const session_id_owned = entry.key_ptr.*;
@@ -135,7 +137,6 @@ pub const ConnectionManager = struct {
             flag.store(true, .release);
             log.info("Abort flag set for session: {s}", .{session_id});
         } else {
-            // Create abort flag if it doesn't exist
             const owned_id = try self.allocator.dupe(u8, session_id);
             const flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(true);
             try self.abort_flags.put(owned_id, flag);
@@ -147,10 +148,7 @@ pub const ConnectionManager = struct {
     pub fn isAborted(self: *Self, session_id: []const u8) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
-
-        if (self.abort_flags.getPtr(session_id)) |flag| {
-            return flag.load(.acquire);
-        }
+        if (self.abort_flags.getPtr(session_id)) |flag| return flag.load(.acquire);
         return false;
     }
 
@@ -158,7 +156,6 @@ pub const ConnectionManager = struct {
     pub fn clearAbort(self: *Self, session_id: []const u8) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-
         if (self.abort_flags.getPtr(session_id)) |flag| {
             flag.store(false, .release);
             log.info("Abort flag cleared for session: {s}", .{session_id});
@@ -174,14 +171,12 @@ pub const ConnectionManager = struct {
             self.allocator.free(entry.key);
             log.info("Session removed from abort tracking: {s}", .{session_id});
         }
-
         if (self.event_queues.fetchRemove(session_id)) |entry| {
             var queue = entry.value;
             queue.deinit(self.allocator);
             self.allocator.free(entry.key);
             log.info("Session removed from streaming queues: {s}", .{session_id});
         }
-
         if (self.ws_conns.fetchRemove(session_id)) |entry| {
             entry.value.deinit(self.allocator);
             self.allocator.free(entry.key);
@@ -205,7 +200,6 @@ pub const ConnectionManager = struct {
         return self.ws_conns.getPtr(owned).?;
     }
 
-    /// Register a websocket connection for a session
     pub fn registerWs(self: *Self, session_id: []const u8, conn: *websocket.Conn) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -214,12 +208,17 @@ pub const ConnectionManager = struct {
             log.err("Failed to get/create WS list: {}", .{err});
             return;
         };
-        list.items.append(self.allocator, .{ .conn = conn }) catch |err| {
-            log.err("Failed to append WS conn: {}", .{err});
+        const node = self.allocator.create(ConnRef) catch |err| {
+            log.err("Failed to alloc ConnRef: {}", .{err});
+            return;
+        };
+        node.* = .{ .conn = conn, .write_mutex = .{} };
+        list.items.append(self.allocator, node) catch |err| {
+            log.err("Failed to register websocket: {}", .{err});
+            self.allocator.destroy(node);
         };
     }
 
-    /// Unregister a websocket connection for a session
     pub fn unregisterWs(self: *Self, session_id: []const u8, conn: *websocket.Conn) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -227,12 +226,73 @@ pub const ConnectionManager = struct {
         if (self.ws_conns.getPtr(session_id)) |list| {
             var i: usize = 0;
             while (i < list.items.items.len) : (i += 1) {
-                if (list.items.items[i].conn == conn) {
-                    _ = list.items.orderedRemove(i);
+                const ref_ptr = list.items.items[i];
+                if (ref_ptr.conn == conn) {
+                    // Mark closed. If no writers are using it, remove now;
+                    // otherwise defer actual free to broadcaster/post-write.
+                    ref_ptr.closed = true;
+                    if (ref_ptr.use_count == 0) {
+                        _ = list.items.orderedRemove(i);
+                        self.allocator.destroy(ref_ptr);
+                    }
                     break;
                 }
             }
         }
+    }
+
+    /// Write to a specific websocket connection using the same per-conn mutex
+    /// used by broadcaster. Looks up the `ConnRef` and serializes the write.
+    pub fn writeToConn(self: *Self, session_id: []const u8, conn: *websocket.Conn, data: []const u8) !void {
+        // Lookup under lock and grab a guarded reference.
+        self.mutex.lock();
+        const list_ptr = self.ws_conns.getPtr(session_id);
+        var ref_ptr: ?*ConnRef = null;
+        if (list_ptr) |lp| {
+            for (lp.items.items) |r| {
+                if (r.conn == conn and !r.closed) {
+                    r.use_count += 1;
+                    ref_ptr = r;
+                    break;
+                }
+            }
+        }
+        self.mutex.unlock();
+        if (ref_ptr == null) return error.ConnectionNotFound;
+
+        // Serialize writes per-connection outside the global lock.
+        const r = ref_ptr.?;
+        var write_err: ?anyerror = null;
+        r.write_mutex.lock();
+        r.conn.write(data) catch |err| {
+            write_err = err;
+        };
+        r.write_mutex.unlock();
+
+        // Release the guarded reference and prune if closed and unused.
+        self.mutex.lock();
+        const list2 = self.ws_conns.getPtr(session_id);
+        if (list2) |lp| {
+            // `r` must still be in the list; if it was concurrently closed,
+            // keep it until use_count reaches zero.
+            r.use_count -= 1;
+            if (write_err != null) {
+                r.closed = true;
+            }
+            if (r.closed and r.use_count == 0) {
+                var i: usize = 0;
+                while (i < lp.items.items.len) : (i += 1) {
+                    if (lp.items.items[i] == r) {
+                        _ = lp.items.orderedRemove(i);
+                        self.allocator.destroy(r);
+                        break;
+                    }
+                }
+            }
+        }
+        self.mutex.unlock();
+
+        if (write_err) |e| return e;
     }
 
     /// Internal: append event to session queue (with simple trimming)
@@ -277,54 +337,71 @@ pub const ConnectionManager = struct {
                 self.allocator.free(ev.event_type);
                 self.allocator.free(ev.data);
             }
-            // Shift remaining to front safely (overlapping move)
-            const remaining = queue.events.items[drop..];
-            std.mem.copyBackwards(Event, queue.events.items[0..remaining.len], remaining);
-            // Update slice len; capacity unchanged
-            queue.events.items = queue.events.items[0..remaining.len];
+            // Move the last half down
+            const keep = MAX_EVENTS / 2;
+            std.mem.copyBackwards(Event, queue.events.items[0..keep], queue.events.items[drop..][0..keep]);
+            queue.events.items.len = keep;
         }
     }
 
-    /// Broadcast a JSON message to all websocket clients of a session
+    /// Broadcast JSON over WebSocket to all connections in a session.
+    /// Takes a snapshot under lock and writes outside the global lock.
     fn broadcastWsJson(self: *Self, session_id: []const u8, json_text: []const u8) void {
-        // Snapshot list under lock
+        // Snapshot current connections under the manager lock and guard them
+        // with an in-use reference so they cannot be freed concurrently.
         self.mutex.lock();
         const list_ptr = self.ws_conns.getPtr(session_id);
-        var scratch = std.ArrayList(*websocket.Conn).init(self.allocator);
+        var snapshot = std.ArrayList(*ConnRef).init(self.allocator);
         if (list_ptr) |lp| {
-            for (lp.items.items) |ref| {
-                scratch.append(ref.conn) catch {};
+            for (lp.items.items) |ref_ptr| {
+                ref_ptr.use_count += 1;
+                _ = snapshot.append(ref_ptr) catch {
+                    // rollback the guard if append fails
+                    ref_ptr.use_count -= 1;
+                };
             }
         }
         self.mutex.unlock();
+        defer snapshot.deinit();
 
-        // Write outside of lock; drop closed connections
-        var dead: std.ArrayList(*websocket.Conn) = .{};
-        defer dead.deinit(self.allocator);
-
-        for (scratch.items) |c| {
-            c.write(json_text) catch |err| {
+        // Write to each connection outside the global lock.
+        var failed = std.ArrayList(*ConnRef).init(self.allocator);
+        defer failed.deinit();
+        for (snapshot.items) |ref_ptr| {
+            // Skip already-closed refs; they’ll be cleaned up on release.
+            if (ref_ptr.closed) continue;
+            ref_ptr.write_mutex.lock();
+            ref_ptr.conn.write(json_text) catch |err| {
+                ref_ptr.write_mutex.unlock();
                 log.debug("WS write failed, scheduling removal: {}", .{err});
-                dead.append(c) catch {};
+                _ = failed.append(ref_ptr) catch {};
+                continue;
             };
+            ref_ptr.write_mutex.unlock();
         }
 
-        if (dead.items.len > 0) {
-            self.mutex.lock();
-            if (self.ws_conns.getPtr(session_id)) |list| {
-                for (dead.items) |dc| {
+        // Release references and prune closed/failed conns.
+        self.mutex.lock();
+        if (self.ws_conns.getPtr(session_id)) |lp| {
+            // Mark failures as closed for pruning.
+            for (failed.items) |bad| bad.closed = true;
+
+            for (snapshot.items) |ref_ptr| {
+                // Drop our in-use ref
+                if (ref_ptr.use_count > 0) ref_ptr.use_count -= 1;
+                if (ref_ptr.closed and ref_ptr.use_count == 0) {
                     var i: usize = 0;
-                    while (i < list.items.items.len) : (i += 1) {
-                        if (list.items.items[i].conn == dc) {
-                            _ = list.items.orderedRemove(i);
+                    while (i < lp.items.items.len) : (i += 1) {
+                        if (lp.items.items[i] == ref_ptr) {
+                            _ = lp.items.orderedRemove(i);
+                            self.allocator.destroy(ref_ptr);
                             break;
                         }
                     }
                 }
             }
-            self.mutex.unlock();
         }
-        scratch.deinit(self.allocator);
+        self.mutex.unlock();
     }
 
     pub const FlushResult = struct { next_index: usize, terminal: bool, write_error: bool = false };
@@ -332,7 +409,7 @@ pub const ConnectionManager = struct {
     /// Flush queued events since index to an SSE response writer.
     /// Locks only to snapshot events; releases the lock during network I/O.
     pub fn flushSSE(self: *Self, session_id: []const u8, writer: anytype, from_index: usize) FlushResult {
-        // Snapshot under lock
+        // Snapshot under lock, duplicating event strings to avoid UAF while producer trims
         self.mutex.lock();
         const queue_ptr = self.event_queues.getPtr(session_id);
         if (queue_ptr == null) {
@@ -347,59 +424,81 @@ pub const ConnectionManager = struct {
             return .{ .next_index = total, .terminal = term, .write_error = false };
         }
 
-        // Clone events to write outside the lock
-        var to_write = std.ArrayList(Event){};
-        defer to_write.deinit(self.allocator);
+        var to_write = std.ArrayList(Event).init(self.allocator);
         var i: usize = from_index;
         while (i < total) : (i += 1) {
             const ev = queue.events.items[i];
-            const et = self.allocator.dupe(u8, ev.event_type) catch break;
+            const et = self.allocator.dupe(u8, ev.event_type) catch {
+                self.mutex.unlock();
+                to_write.deinit();
+                return .{ .next_index = from_index, .terminal = queue.terminal, .write_error = true };
+            };
             const dj = self.allocator.dupe(u8, ev.data) catch {
                 self.allocator.free(et);
-                break;
+                self.mutex.unlock();
+                to_write.deinit();
+                return .{ .next_index = from_index, .terminal = queue.terminal, .write_error = true };
             };
-            to_write.append(self.allocator, .{ .event_type = et, .data = dj }) catch {
+            _ = to_write.append(.{ .event_type = et, .data = dj }) catch {
                 self.allocator.free(et);
                 self.allocator.free(dj);
-                break;
+                self.mutex.unlock();
+                to_write.deinit();
+                return .{ .next_index = from_index, .terminal = queue.terminal, .write_error = true };
             };
         }
-        const term = queue.terminal;
+        const terminal_now = queue.terminal;
         self.mutex.unlock();
 
-        // Perform writes without holding the lock
-        for (to_write.items, 0..) |ev, idx| {
-            defer {
-                self.allocator.free(ev.event_type);
-                self.allocator.free(ev.data);
+        defer {
+            for (to_write.items) |ev2| {
+                self.allocator.free(ev2.event_type);
+                self.allocator.free(ev2.data);
             }
-            writer.print("event: {s}\n", .{ev.event_type}) catch |err| {
-                log.warn("SSE write failed (event header): {}", .{err});
-                const progressed = from_index + idx;
-                return .{ .next_index = progressed, .terminal = term, .write_error = true };
-            };
-            writer.print("data: {s}\n\n", .{ev.data}) catch |err| {
-                log.warn("SSE write failed (data): {}", .{err});
-                const progressed = from_index + idx;
-                return .{ .next_index = progressed, .terminal = term, .write_error = true };
-            };
+            to_write.deinit();
         }
 
-        return .{ .next_index = total, .terminal = term, .write_error = false };
+        // Write outside the lock
+        var wrote: usize = 0;
+        for (to_write.items) |evw| {
+            writer.writeAll("event: ") catch break;
+            writer.writeAll(evw.event_type) catch break;
+            writer.writeAll("\n") catch break;
+            writer.writeAll("data: ") catch break;
+            writer.writeAll(evw.data) catch break;
+            writer.writeAll("\n\n") catch break;
+            wrote += 1;
+        }
+
+        const had_error = wrote != to_write.items.len;
+        return .{ .next_index = from_index + wrote, .terminal = terminal_now, .write_error = had_error };
     }
+
+    // -------------------------------------------------------------------------
+    // Broadcast helpers (build compact JSON then queue + dispatch over WS)
+    // -------------------------------------------------------------------------
 
     /// Broadcast a token event to all subscribers of a session
     pub fn broadcastToken(self: *Self, session_id: []const u8, message_id: []const u8, text: []const u8, token_index: usize) void {
         var list = std.ArrayList(u8){};
         defer list.deinit(self.allocator);
         const w = list.writer(self.allocator);
-        // {"type":"token","session_id":"...","message_id":"...","text":"...","token_index":N}
         w.writeAll("{") catch return;
-        json.writeKey(w, "type") catch return; w.writeAll("\"token\"") catch return; w.writeAll(",") catch return;
-        json.writeKey(w, "session_id") catch return; json.writeString(w, session_id) catch return; w.writeAll(",") catch return;
-        json.writeKey(w, "message_id") catch return; json.writeString(w, message_id) catch return; w.writeAll(",") catch return;
-        json.writeKey(w, "text") catch return; json.writeString(w, text) catch return; w.writeAll(",") catch return;
-        json.writeKey(w, "token_index") catch return; json.writeNumber(w, token_index) catch return; w.writeAll("}") catch return;
+        json.writeKey(w, "type") catch return;
+        w.writeAll("\"token\"") catch return;
+        w.writeAll(",") catch return;
+        json.writeKey(w, "session_id") catch return;
+        json.writeString(w, session_id) catch return;
+        w.writeAll(",") catch return;
+        json.writeKey(w, "message_id") catch return;
+        json.writeString(w, message_id) catch return;
+        w.writeAll(",") catch return;
+        json.writeKey(w, "text") catch return;
+        json.writeString(w, text) catch return;
+        w.writeAll(",") catch return;
+        json.writeKey(w, "token_index") catch return;
+        json.writeNumber(w, token_index) catch return;
+        w.writeAll("}") catch return;
         const msg = list.toOwnedSlice(self.allocator) catch return;
         defer self.allocator.free(msg);
         self.enqueueEvent(session_id, "token", msg);
@@ -412,11 +511,21 @@ pub const ConnectionManager = struct {
         defer list.deinit(self.allocator);
         const w = list.writer(self.allocator);
         w.writeAll("{") catch return;
-        json.writeKey(w, "type") catch return; w.writeAll("\"tool_start\"") catch return; w.writeAll(",") catch return;
-        json.writeKey(w, "session_id") catch return; json.writeString(w, session_id) catch return; w.writeAll(",") catch return;
-        json.writeKey(w, "message_id") catch return; json.writeString(w, message_id) catch return; w.writeAll(",") catch return;
-        json.writeKey(w, "tool_id") catch return; json.writeString(w, tool_id) catch return; w.writeAll(",") catch return;
-        json.writeKey(w, "tool_name") catch return; json.writeString(w, tool_name) catch return; w.writeAll("}") catch return;
+        json.writeKey(w, "type") catch return;
+        w.writeAll("\"tool_start\"") catch return;
+        w.writeAll(",") catch return;
+        json.writeKey(w, "session_id") catch return;
+        json.writeString(w, session_id) catch return;
+        w.writeAll(",") catch return;
+        json.writeKey(w, "message_id") catch return;
+        json.writeString(w, message_id) catch return;
+        w.writeAll(",") catch return;
+        json.writeKey(w, "tool_id") catch return;
+        json.writeString(w, tool_id) catch return;
+        w.writeAll(",") catch return;
+        json.writeKey(w, "tool_name") catch return;
+        json.writeString(w, tool_name) catch return;
+        w.writeAll("}") catch return;
         const msg = list.toOwnedSlice(self.allocator) catch return;
         defer self.allocator.free(msg);
         self.enqueueEvent(session_id, "tool_start", msg);
@@ -429,13 +538,21 @@ pub const ConnectionManager = struct {
         defer list.deinit(self.allocator);
         const w = list.writer(self.allocator);
         w.writeAll("{") catch return;
-        json.writeKey(w, "type") catch return; w.writeAll("\"tool_end\"") catch return; w.writeAll(",") catch return;
-        json.writeKey(w, "session_id") catch return; json.writeString(w, session_id) catch return; w.writeAll(",") catch return;
-        json.writeKey(w, "tool_id") catch return; json.writeString(w, tool_id) catch return; w.writeAll(",") catch return;
-        json.writeKey(w, "tool_state") catch return; json.writeString(w, tool_state) catch return;
+        json.writeKey(w, "type") catch return;
+        w.writeAll("\"tool_end\"") catch return;
+        w.writeAll(",") catch return;
+        json.writeKey(w, "session_id") catch return;
+        json.writeString(w, session_id) catch return;
+        w.writeAll(",") catch return;
+        json.writeKey(w, "tool_id") catch return;
+        json.writeString(w, tool_id) catch return;
+        w.writeAll(",") catch return;
+        json.writeKey(w, "tool_state") catch return;
+        json.writeString(w, tool_state) catch return;
         if (output) |out| {
             w.writeAll(",") catch return;
-            json.writeKey(w, "output") catch return; json.writeString(w, out) catch return;
+            json.writeKey(w, "output") catch return;
+            json.writeString(w, out) catch return;
         }
         w.writeAll("}") catch return;
         const msg = list.toOwnedSlice(self.allocator) catch return;
@@ -450,8 +567,11 @@ pub const ConnectionManager = struct {
         defer list.deinit(self.allocator);
         const w = list.writer(self.allocator);
         w.writeAll("{") catch return;
-        json.writeKey(w, "type") catch return; w.writeAll("\"done\"") catch return; w.writeAll(",") catch return;
-        json.writeKey(w, "session_id") catch return; json.writeString(w, session_id) catch return;
+        json.writeKey(w, "type") catch return;
+        w.writeAll("\"done\"") catch return;
+        w.writeAll(",") catch return;
+        json.writeKey(w, "session_id") catch return;
+        json.writeString(w, session_id) catch return;
         w.writeAll("}") catch return;
         const msg = list.toOwnedSlice(self.allocator) catch return;
         defer self.allocator.free(msg);
@@ -465,9 +585,14 @@ pub const ConnectionManager = struct {
         defer list.deinit(self.allocator);
         const w = list.writer(self.allocator);
         w.writeAll("{") catch return;
-        json.writeKey(w, "type") catch return; w.writeAll("\"error\"") catch return; w.writeAll(",") catch return;
-        json.writeKey(w, "session_id") catch return; json.writeString(w, session_id) catch return; w.writeAll(",") catch return;
-        json.writeKey(w, "message") catch return; json.writeString(w, message) catch return;
+        json.writeKey(w, "type") catch return;
+        w.writeAll("\"error\"") catch return;
+        w.writeAll(",") catch return;
+        json.writeKey(w, "session_id") catch return;
+        json.writeString(w, session_id) catch return;
+        w.writeAll(",") catch return;
+        json.writeKey(w, "message") catch return;
+        json.writeString(w, message) catch return;
         w.writeAll("}") catch return;
         const msg = list.toOwnedSlice(self.allocator) catch return;
         defer self.allocator.free(msg);
@@ -484,6 +609,7 @@ pub const WebsocketClient = struct {
     conn: *websocket.Conn,
     manager: *ConnectionManager,
     session_id: []const u8, // owned copy
+    allocator: std.mem.Allocator,
 
     pub const Context = struct {
         manager: *ConnectionManager,
@@ -494,32 +620,32 @@ pub const WebsocketClient = struct {
     pub fn init(conn: *websocket.Conn, ctx: *const Context) !WebsocketClient {
         // own a copy of session_id since req memory won't outlive the connection
         const sid = try ctx.allocator.dupe(u8, ctx.session_id);
-        return .{ .conn = conn, .manager = ctx.manager, .session_id = sid };
+        return .{ .conn = conn, .manager = ctx.manager, .session_id = sid, .allocator = ctx.allocator };
     }
 
     /// First safe point to write to the connection. Also registers with manager.
     pub fn afterInit(self: *WebsocketClient) !void {
         self.manager.registerWs(self.session_id, self.conn);
         // Send a small greeting/ack
-        try self.conn.write("{\"type\":\"connected\"}");
+        try self.manager.writeToConn(self.session_id, self.conn, "{\"type\":\"connected\"}");
     }
 
     /// Optional: receive client->server messages. For now support an abort signal.
     pub fn clientMessage(self: *WebsocketClient, data: []const u8) !void {
         if (std.mem.eql(u8, data, "abort")) {
             self.manager.abort(self.session_id) catch {};
-            return self.conn.write("{\"type\":\"aborted\"}");
+            return self.manager.writeToConn(self.session_id, self.conn, "{\"type\":\"aborted\"}");
         }
         // Echo small pings
         if (std.mem.eql(u8, data, "ping")) {
-            return self.conn.write("pong");
+            return self.manager.writeToConn(self.session_id, self.conn, "pong");
         }
     }
 
     /// Called on connection close; unregister and free state
     pub fn close(self: *WebsocketClient) void {
         self.manager.unregisterWs(self.session_id, self.conn);
-        std.heap.page_allocator.free(self.session_id);
+        self.allocator.free(self.session_id);
     }
 };
 

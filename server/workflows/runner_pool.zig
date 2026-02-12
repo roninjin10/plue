@@ -37,8 +37,29 @@ pub const RunnerPool = struct {
         pod_name: []const u8,
         pod_ip: []const u8,
         node_name: ?[]const u8,
+        labels: ?[]const []const u8,
     ) !i32 {
-        return try db.workflows.registerRunner(self.db_pool, pod_name, pod_ip, node_name);
+        // Encode labels to JSON if provided (dynamic buffer to avoid size limits)
+        const labels_json: ?[]const u8 = blk: {
+            if (labels) |arr| {
+                var list = std.ArrayList(u8){};
+                defer list.deinit(self.allocator);
+                const w = list.writer(self.allocator);
+                try w.writeByte('[');
+                var count: usize = 0;
+                for (arr) |lab| {
+                    if (lab.len == 0) continue;
+                    if (count > 0) try w.writeByte(',');
+                    try std.json.stringify(lab, .{}, w);
+                    count += 1;
+                }
+                try w.writeByte(']');
+                break :blk try list.toOwnedSlice(self.allocator);
+            }
+            break :blk null;
+        };
+        defer if (labels_json) |lj| self.allocator.free(lj);
+        return try db.workflows.registerRunner(self.db_pool, pod_name, pod_ip, node_name, labels_json);
     }
 
     /// Update heartbeat for a runner

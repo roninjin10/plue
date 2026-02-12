@@ -279,7 +279,8 @@ pub const WorkflowJobLegacy = struct {
     status: []const u8,
 };
 
-pub const WorkflowTaskLegacy = struct {
+/* REMOVED legacy WorkflowTaskLegacy struct */
+/*
     id: i64,
     job_id: i64,
     attempt: i32,
@@ -287,7 +288,7 @@ pub const WorkflowTaskLegacy = struct {
     commit_sha: ?[]const u8,
     workflow_content: []const u8,
     workflow_path: []const u8,
-};
+*/
 
 pub const WorkflowLogLegacy = struct {
     content: []const u8,
@@ -451,65 +452,11 @@ pub fn updateRunnerHeartbeat(pool: *Pool, token_hash: []const u8) !void {
     , .{token_hash});
 }
 
-pub fn freeWorkflowTask(allocator: std.mem.Allocator, task: *const WorkflowTaskLegacy) void {
-    allocator.free(task.workflow_content);
-    allocator.free(task.workflow_path);
-}
 
-pub fn findAvailableTask(pool: *Pool, allocator: std.mem.Allocator, runner_id: i64) !?WorkflowTaskLegacy {
-    _ = runner_id; // TODO: filter by runner labels
-    const row = try pool.row(
-        \\SELECT id, job_id, attempt, repository_id, commit_sha,
-        \\       COALESCE(workflow_content, '') as workflow_content,
-        \\       COALESCE(workflow_path, '') as workflow_path
-        \\FROM workflow_tasks
-        \\WHERE status = 'pending'
-        \\ORDER BY created_at ASC
-        \\LIMIT 1
-    , .{});
 
-    if (row) |r| {
-        return WorkflowTaskLegacy{
-            .id = r.get(i64, 0),
-            .job_id = r.get(i64, 1),
-            .attempt = r.get(i32, 2),
-            .repository_id = r.get(i64, 3),
-            .commit_sha = r.get(?[]const u8, 4),
-            .workflow_content = try allocator.dupe(u8, r.get([]const u8, 5)),
-            .workflow_path = try allocator.dupe(u8, r.get([]const u8, 6)),
-        };
-    }
-    return null;
-}
 
-pub fn updateTaskStatus(pool: *Pool, task_id: i64, status: i32) !void {
-    _ = try pool.exec(
-        \\UPDATE workflow_tasks SET status = $2, updated_at = NOW() WHERE id = $1
-    , .{ task_id, status });
-}
 
-pub fn appendWorkflowLogs(pool: *Pool, task_id: i64, step_index: i32, lines: []const []const u8) !void {
-    for (lines, 0..) |line, i| {
-        _ = try pool.exec(
-            \\INSERT INTO workflow_logs (task_id, step_index, line_number, content)
-            \\VALUES ($1, $2, $3, $4)
-        , .{ task_id, step_index, @as(i32, @intCast(i)), line });
-    }
-}
 
-pub fn assignTaskToRunner(pool: *Pool, task_id: i64, runner_id: i64, token_hash: []const u8) !void {
-    _ = try pool.exec(
-        \\UPDATE workflow_tasks
-        \\SET runner_id = $2, token_hash = $3, status = 'running', started_at = NOW(), updated_at = NOW()
-        \\WHERE id = $1
-    , .{ task_id, runner_id, token_hash });
-}
-
-pub fn updateJobStatusFromTask(pool: *Pool, job_id: i64, status: i32) !void {
-    _ = try pool.exec(
-        \\UPDATE workflow_jobs SET status = $2, updated_at = NOW() WHERE id = $1
-    , .{ job_id, status });
-}
 
 pub fn createWorkflowRun(
     pool: *Pool,
@@ -581,42 +528,7 @@ pub fn listWorkflowRuns(
     return try runs.toOwnedSlice(allocator);
 }
 
-pub fn getRunnerByToken(pool: *Pool, token_hash: []const u8) !?Runner {
-    const row = try pool.row(
-        \\SELECT id, name FROM workflow_runners WHERE token_hash = $1
-    , .{token_hash});
 
-    if (row) |r| {
-        return Runner{
-            .id = r.get(i64, 0),
-            .name = r.get([]const u8, 1),
-        };
-    }
-    return null;
-}
-
-pub fn getTaskByToken(pool: *Pool, allocator: std.mem.Allocator, token_hash: []const u8) !?WorkflowTaskLegacy {
-    const row = try pool.row(
-        \\SELECT id, job_id, attempt, repository_id, commit_sha,
-        \\       COALESCE(workflow_content, '') as workflow_content,
-        \\       COALESCE(workflow_path, '') as workflow_path
-        \\FROM workflow_tasks
-        \\WHERE token_hash = $1
-    , .{token_hash});
-
-    if (row) |r| {
-        return WorkflowTaskLegacy{
-            .id = r.get(i64, 0),
-            .job_id = r.get(i64, 1),
-            .attempt = r.get(i32, 2),
-            .repository_id = r.get(i64, 3),
-            .commit_sha = r.get(?[]const u8, 4),
-            .workflow_content = try allocator.dupe(u8, r.get([]const u8, 5)),
-            .workflow_path = try allocator.dupe(u8, r.get([]const u8, 6)),
-        };
-    }
-    return null;
-}
 
 // =============================================================================
 // JJ Operations

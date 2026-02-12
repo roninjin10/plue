@@ -1010,16 +1010,78 @@ CREATE TABLE IF NOT EXISTS runner_pool (
   pod_name VARCHAR(255) UNIQUE NOT NULL,
   pod_ip VARCHAR(45) NOT NULL,
   node_name VARCHAR(255),
+  -- Optional labels for runner selection (JSON array of strings)
+  labels JSONB,
   status VARCHAR(20) NOT NULL DEFAULT 'available' CHECK (status IN ('available', 'claimed', 'terminated')),
   registered_at TIMESTAMPTZ DEFAULT NOW(),
   last_heartbeat TIMESTAMPTZ DEFAULT NOW(),
   claimed_at TIMESTAMPTZ,
+  -- New task-based assignment pointer. Kept alongside legacy step-based field for compatibility.
+  claimed_by_task_id INTEGER,
   claimed_by_step_id INTEGER REFERENCES workflow_steps(id) ON DELETE SET NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_runner_pool_status ON runner_pool(status);
 CREATE INDEX IF NOT EXISTS idx_runner_pool_available ON runner_pool(status) WHERE status = 'available';
 CREATE INDEX IF NOT EXISTS idx_runner_pool_heartbeat ON runner_pool(last_heartbeat);
+
+-- =============================================================================
+-- Workflow Task Queue (Persistent)
+-- =============================================================================
+
+-- Persistent task records for agents and workflows. These decouple submission
+-- from runner assignment and survive server restarts.
+CREATE TABLE IF NOT EXISTS workflow_tasks (
+  id SERIAL PRIMARY KEY,
+  workload_type VARCHAR(20) NOT NULL CHECK (workload_type IN ('agent', 'workflow')),
+  -- Links for observability (nullable for agent-only tasks)
+  workflow_run_id INTEGER REFERENCES workflow_runs(id) ON DELETE SET NULL,
+  session_id VARCHAR(64) REFERENCES sessions(id) ON DELETE SET NULL,
+
+  -- Scheduling/priority
+  priority SMALLINT NOT NULL DEFAULT 1 CHECK (priority BETWEEN 0 AND 3),
+  required_labels JSONB DEFAULT '[]', -- JSON array of strings
+
+  -- Execution config
+  config_json JSONB,
+
+  -- State machine
+  status VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (status IN (
+    'pending',     -- created, waiting for assignment
+    'assigned',    -- assigned to a runner, awaiting start
+    'running',     -- actively executing
+    'completed',   -- finished successfully
+    'failed',      -- execution failed
+    'cancelled'    -- cancelled by user/system
+  )),
+
+  -- Assignment details
+  assigned_runner_id INTEGER REFERENCES runner_pool(id) ON DELETE SET NULL,
+  assigned_at TIMESTAMPTZ,
+
+  -- Timing and result
+  started_at TIMESTAMPTZ,
+  completed_at TIMESTAMPTZ,
+  error_message TEXT,
+
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_workflow_tasks_status ON workflow_tasks(status);
+CREATE INDEX IF NOT EXISTS idx_workflow_tasks_priority ON workflow_tasks(priority DESC, created_at);
+CREATE INDEX IF NOT EXISTS idx_workflow_tasks_runner ON workflow_tasks(assigned_runner_id) WHERE assigned_runner_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_workflow_tasks_run ON workflow_tasks(workflow_run_id) WHERE workflow_run_id IS NOT NULL;
+-- Hot-path partial index for pending tasks ordered by priority/created_at
+CREATE INDEX IF NOT EXISTS idx_workflow_tasks_pending
+  ON workflow_tasks(priority DESC, created_at)
+  WHERE status = 'pending';
+
+-- JSONB index to accelerate label containment queries
+-- Enables predicates like (runner.labels @> workflow_tasks.required_labels)
+-- and general jsonb containment lookups used in scheduler matching.
+CREATE INDEX IF NOT EXISTS idx_workflow_tasks_required_labels_gin
+  ON workflow_tasks USING GIN (required_labels jsonb_path_ops);
 
 -- =============================================================================
 -- Landing Queue (Pull Request Landing System)

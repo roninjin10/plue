@@ -7,6 +7,7 @@ const std = @import("std");
 const httpz = @import("httpz");
 const db = @import("db");
 const queue = @import("../dispatch/queue.zig");
+const workflows_mod = @import("../workflows/mod.zig");
 const json = @import("../lib/json.zig");
 
 const log = std.log.scoped(.internal);
@@ -76,10 +77,26 @@ pub fn registerRunner(ctx: *Context, req: *httpz.Request, res: *httpz.Response) 
         return;
     };
 
+    const node_name = if (root.get("node_name")) |v| v.string else null;
+    var labels: ?[]const []const u8 = null;
+    if (root.get("labels")) |lv| {
+        if (lv.array.items.len > 0) {
+            var tmp = std.ArrayList([]const u8).init(ctx.allocator);
+            defer tmp.deinit();
+            for (lv.array.items) |it| {
+                if (it.string.len == 0) continue;
+                try tmp.append(it.string);
+            }
+            labels = try tmp.toOwnedSlice();
+        }
+    }
+    defer if (labels) |ls| ctx.allocator.free(ls);
+
     log.info("Registering runner: {s} ({s})", .{ pod_name, pod_ip });
 
-    // Register runner and check for pending tasks
-    const runner_id = queue.registerRunner(ctx.pool, pod_name, pod_ip) catch |err| {
+    // Register via RunnerPool DAO (handles labels and node)
+    var pool_mgr = workflows_mod.RunnerPool.init(ctx.allocator, ctx.pool);
+    const runner_id = pool_mgr.registerRunner(pod_name, pod_ip, node_name, labels) catch |err| {
         log.err("Failed to register runner: {}", .{err});
         res.status = 500;
         try res.writer().writeAll("{\"error\":\"Failed to register runner\"}");
@@ -107,10 +124,20 @@ pub fn registerRunner(ctx: *Context, req: *httpz.Request, res: *httpz.Response) 
             try writer.writeAll(sid);
             try writer.writeAll("\"");
         }
-        try writer.writeAll("},\"callback_url\":\"");
-        try writer.writeAll("https://api.plue.dev/internal/tasks/");
-        try writer.print("{d}", .{task.task_id});
-        try writer.writeAll("/stream\"}");
+        // Prefer returning callback_path; callback_url only if configured
+        const base = ctx.config.public_base_url;
+        if (base.len > 0) {
+            try writer.writeAll("},\"callback_url\":\"");
+            try writer.writeAll(base);
+            if (!std.mem.endsWith(u8, base, "/")) try writer.writeAll("/");
+            try writer.writeAll("internal/tasks/");
+            try writer.print("{d}", .{task.task_id});
+            try writer.writeAll("/stream\"}");
+        } else {
+            try writer.writeAll("},\"callback_path\":\"/internal/tasks/");
+            try writer.print("{d}", .{task.task_id});
+            try writer.writeAll("/stream\"}");
+        }
     } else {
         // No pending task, just acknowledge registration
         var writer = res.writer();
@@ -121,21 +148,27 @@ pub fn registerRunner(ctx: *Context, req: *httpz.Request, res: *httpz.Response) 
 }
 
 // =============================================================================
-// POST /internal/runners/:pod_name/heartbeat - Update runner heartbeat
+// POST /internal/runners/:runner_id/heartbeat - Update runner heartbeat
 // =============================================================================
 
-pub fn runnerHeartbeat(ctx: *Context, req: *httpz.Request, res: *httpz.Response) !void {
+pub fn runnerHeartbeatId(ctx: *Context, req: *httpz.Request, res: *httpz.Response) !void {
     res.content_type = .JSON;
 
     if (!try requireInternalAuth(ctx, req, res)) return;
 
-    const pod_name = req.param("pod_name") orelse {
+    const runner_id_str = req.param("runner_id") orelse {
         res.status = 400;
-        try res.writer().writeAll("{\"error\":\"Missing pod_name\"}");
+        try res.writer().writeAll("{\"error\":\"Missing runner_id\"}");
+        return;
+    };
+    const runner_id = std.fmt.parseInt(i32, runner_id_str, 10) catch {
+        res.status = 400;
+        try res.writer().writeAll("{\"error\":\"Invalid runner_id\"}");
         return;
     };
 
-    queue.updateHeartbeat(ctx.pool, pod_name) catch |err| {
+    var pool_mgr = workflows_mod.RunnerPool.init(ctx.allocator, ctx.pool);
+    pool_mgr.updateHeartbeat(runner_id) catch |err| {
         log.err("Failed to update heartbeat: {}", .{err});
         res.status = 500;
         try res.writer().writeAll("{\"error\":\"Failed to update heartbeat\"}");
@@ -187,7 +220,12 @@ pub fn streamTaskEvent(ctx: *Context, req: *httpz.Request, res: *httpz.Response)
         return;
     };
 
-    const run_id: i32 = task_id;
+    // Resolve workflow run_id from workflow_tasks (fallback to task_id for legacy)
+    var run_id: i32 = task_id;
+    const run_row = try ctx.pool.row(
+        \\SELECT COALESCE(workflow_run_id, $1)::int FROM workflow_tasks WHERE id = $1
+    , .{task_id});
+    if (run_row) |r| run_id = r.get(i32, 0);
     // Resolve session_id for this run (used for SSE broadcasting)
     const run_info_opt = db.workflows.getWorkflowRun(ctx.pool, run_id) catch null;
     const session_id: ?[]const u8 = if (run_info_opt) |ri| ri.session_id else null;
@@ -273,6 +311,10 @@ pub fn streamTaskEvent(ctx: *Context, req: *httpz.Request, res: *httpz.Response)
                 log.err("Failed to mark step running: {}", .{err});
             };
         }
+        // Also advance task to running
+        queue.markTaskRunning(ctx.pool, task_id) catch |err| {
+            log.err("Failed to mark task running: {}", .{err});
+        };
     } else if (std.mem.eql(u8, event_type, "step_end")) {
         const step_state = if (root.get("step_state")) |v| v.string else "success";
         const output_value = root.get("output");
@@ -314,8 +356,8 @@ pub fn streamTaskEvent(ctx: *Context, req: *httpz.Request, res: *httpz.Response)
     } else if (std.mem.eql(u8, event_type, "error")) {
         const message = if (root.get("message")) |v| v.string else "Unknown error";
 
-        // Mark task as failed
-        queue.completeTask(ctx.pool, task_id, false) catch |err| {
+        // Mark task as failed with message
+        queue.completeTaskWithError(ctx.pool, task_id, message) catch |err| {
             log.err("Failed to mark task as failed: {}", .{err});
         };
 

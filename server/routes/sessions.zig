@@ -1352,23 +1352,24 @@ pub fn streamSession(ctx: *Context, req: *httpz.Request, res: *httpz.Response) !
     const keepalive_ns: i128 = 20 * std.time.ns_per_s;
     const tick_ns: u64 = 25 * std.time.ns_per_ms; // ~25ms cadence
     while (true) {
+        const now: i128 = std.time.nanoTimestamp();
         if (ctx.connection_manager) |cm| {
             if (cm.isAborted(session_id)) {
                 // Inform client the stream is aborted and exit
-                try writer.writeAll('event: aborted\ndata: {\type\\:\x07borted\\}\n\n');
+                try writer.writeAll("event: aborted\ndata: {\"type\":\"aborted\"}\n\n");
                 metrics.global.streamClosed();
                 break;
             }
 
             // Flush any new events since cursor
+            const prev_cursor = cursor;
             const fr = cm.flushSSE(session_id, writer, cursor);
             cursor = fr.next_index;
             if (fr.write_error) { metrics.global.streamClosed(); break; }
             if (fr.terminal) { metrics.global.streamClosed(); break; }
 
             // Idle keepalive if no progress for ~20s
-            const now = std.time.nanoTimestamp();
-            if (now - last_keepalive >= keepalive_ns and fr.next_index == cursor) {
+            if (now - last_keepalive >= keepalive_ns and fr.next_index == prev_cursor) {
                 writer.writeAll(': keepalive\n\n') catch { metrics.global.streamClosed(); break; };
                 last_keepalive = now;
             }

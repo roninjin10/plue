@@ -766,6 +766,9 @@ pub const RunnerPoolEntry = struct {
     pod_name: []const u8,
     pod_ip: []const u8,
     node_name: ?[]const u8,
+    // Optional labels for selection
+    // Stored as JSONB in DB; surfaced as text for now
+    labels: ?[]const u8,
     status: []const u8, // available, claimed, terminated
     registered_at: i64, // Unix timestamp
     last_heartbeat: i64, // Unix timestamp
@@ -779,16 +782,17 @@ pub fn registerRunner(
     pod_name: []const u8,
     pod_ip: []const u8,
     node_name: ?[]const u8,
+    labels_json: ?[]const u8,
 ) !i32 {
     const row = try pool.row(
-        \\INSERT INTO runner_pool (pod_name, pod_ip, node_name, status, registered_at, last_heartbeat)
-        \\VALUES ($1, $2, $3, 'available', NOW(), NOW())
+        \\INSERT INTO runner_pool (pod_name, pod_ip, node_name, labels, status, registered_at, last_heartbeat)
+        \\VALUES ($1, $2, $3, COALESCE($4::jsonb, labels), 'available', NOW(), NOW())
         \\ON CONFLICT (pod_name) DO UPDATE SET
-        \\  pod_ip = $2, node_name = $3, status = 'available',
+        \\  pod_ip = $2, node_name = $3, labels = COALESCE($4::jsonb, runner_pool.labels), status = 'available',
         \\  registered_at = NOW(), last_heartbeat = NOW(),
         \\  claimed_at = NULL, claimed_by_task_id = NULL
         \\RETURNING id
-    , .{ pod_name, pod_ip, node_name });
+    , .{ pod_name, pod_ip, node_name, labels_json });
 
     if (row) |r| {
         return r.get(i32, 0);
@@ -877,7 +881,7 @@ pub fn terminateRunner(
 /// Get runner by ID
 pub fn getRunner(pool: *Pool, runner_id: i32) !?RunnerPoolEntry {
     const row = try pool.row(
-        \\SELECT id, pod_name, pod_ip, node_name, status,
+        \\SELECT id, pod_name, pod_ip, node_name, labels::text, status,
         \\       EXTRACT(EPOCH FROM registered_at)::bigint,
         \\       EXTRACT(EPOCH FROM last_heartbeat)::bigint,
         \\       EXTRACT(EPOCH FROM claimed_at)::bigint,
@@ -891,11 +895,12 @@ pub fn getRunner(pool: *Pool, runner_id: i32) !?RunnerPoolEntry {
             .pod_name = r.get([]const u8, 1),
             .pod_ip = r.get([]const u8, 2),
             .node_name = r.get(?[]const u8, 3),
-            .status = r.get([]const u8, 4),
-            .registered_at = r.get(i64, 5),
-            .last_heartbeat = r.get(i64, 6),
-            .claimed_at = r.get(?i64, 7),
-            .claimed_by_task_id = r.get(?i32, 8),
+            .labels = r.get(?[]const u8, 4),
+            .status = r.get([]const u8, 5),
+            .registered_at = r.get(i64, 6),
+            .last_heartbeat = r.get(i64, 7),
+            .claimed_at = r.get(?i64, 8),
+            .claimed_by_task_id = r.get(?i32, 9),
         };
     }
     return null;
@@ -908,7 +913,7 @@ pub fn listRunners(
     status_filter: ?[]const u8,
 ) ![]RunnerPoolEntry {
     const query = if (status_filter) |_|
-        \\SELECT id, pod_name, pod_ip, node_name, status,
+        \\SELECT id, pod_name, pod_ip, node_name, labels::text, status,
         \\       EXTRACT(EPOCH FROM registered_at)::bigint,
         \\       EXTRACT(EPOCH FROM last_heartbeat)::bigint,
         \\       EXTRACT(EPOCH FROM claimed_at)::bigint,
@@ -917,7 +922,7 @@ pub fn listRunners(
         \\WHERE status = $1
         \\ORDER BY registered_at
     else
-        \\SELECT id, pod_name, pod_ip, node_name, status,
+        \\SELECT id, pod_name, pod_ip, node_name, labels::text, status,
         \\       EXTRACT(EPOCH FROM registered_at)::bigint,
         \\       EXTRACT(EPOCH FROM last_heartbeat)::bigint,
         \\       EXTRACT(EPOCH FROM claimed_at)::bigint,
@@ -939,15 +944,27 @@ pub fn listRunners(
             .pod_name = row.get([]const u8, 1),
             .pod_ip = row.get([]const u8, 2),
             .node_name = row.get(?[]const u8, 3),
-            .status = row.get([]const u8, 4),
-            .registered_at = row.get(i64, 5),
-            .last_heartbeat = row.get(i64, 6),
-            .claimed_at = row.get(?i64, 7),
-            .claimed_by_task_id = row.get(?i32, 8),
+            .labels = row.get(?[]const u8, 4),
+            .status = row.get([]const u8, 5),
+            .registered_at = row.get(i64, 6),
+            .last_heartbeat = row.get(i64, 7),
+            .claimed_at = row.get(?i64, 8),
+            .claimed_by_task_id = row.get(?i32, 9),
         });
     }
 
     return try runners.toOwnedSlice(allocator);
+}
+
+/// Update labels for an existing runner
+pub fn updateRunnerLabels(
+    pool: *Pool,
+    runner_id: i32,
+    labels_json: []const u8,
+) !void {
+    _ = try pool.exec(
+        \\UPDATE runner_pool SET labels = $2::jsonb, last_heartbeat = NOW() WHERE id = $1
+    , .{ runner_id, labels_json });
 }
 
 /// Count available runners (healthy and unclaimed)
@@ -972,5 +989,186 @@ pub fn cleanupStaleRunners(pool: *Pool) !i32 {
         \\SET status = 'terminated'
         \\WHERE status != 'terminated'
         \\  AND last_heartbeat < NOW() - INTERVAL '60 seconds'
+    , .{}));
+}
+
+// =============================================================================
+// Workflow Task Queue (Persistent)
+// =============================================================================
+pub const TaskAssignment = struct {
+    task_id: i32,
+    workload_type: []const u8,
+    session_id: ?[]const u8,
+    config_json: ?[]const u8,
+    workflow_run_id: ?i32,
+};
+
+/// Create a workflow task record (pending)
+pub fn createWorkflowTask(
+    pool: *Pool,
+    workload_type: []const u8,
+    workflow_run_id: ?i32,
+    session_id: ?[]const u8,
+    priority: i32,
+    required_labels_json: ?[]const u8, // JSONB array string, defaults to []
+    config_json: ?[]const u8, // JSONB string
+) !i32 {
+    const row = try pool.row(
+        \\INSERT INTO workflow_tasks (
+        \\  workload_type, workflow_run_id, session_id,
+        \\  priority, required_labels, config_json, status, created_at, updated_at
+        \\) VALUES ($1, $2, $3, $4, COALESCE($5::jsonb, '[]'::jsonb), $6::jsonb, 'pending', NOW(), NOW())
+        \\RETURNING id
+    , .{ workload_type, workflow_run_id, session_id, priority, required_labels_json, config_json });
+
+    if (row) |r| return r.get(i32, 0);
+    return error.InsertFailed;
+}
+
+/// Claim highest-priority compatible pending task for a runner (pull-based)
+/// Atomic: selects and marks the task as assigned in one statement
+pub fn claimPendingTaskForRunner(
+    pool: *Pool,
+    runner_id: i32,
+) !?TaskAssignment {
+    const row = try pool.row(
+        \\WITH rl AS (
+        \\  SELECT COALESCE(labels, '[]'::jsonb) AS labels FROM runner_pool WHERE id = $1
+        \\), sel AS (
+        \\  SELECT t.id
+        \\  FROM workflow_tasks t, rl
+        \\  WHERE t.status = 'pending'
+        \\    AND (jsonb_array_length(t.required_labels) = 0 OR rl.labels @> t.required_labels)
+        \\  ORDER BY t.priority DESC, t.created_at
+        \\  FOR UPDATE SKIP LOCKED
+        \\  LIMIT 1
+        \\), upd AS (
+        \\  UPDATE workflow_tasks t
+        \\  SET status = 'assigned', assigned_runner_id = $1, assigned_at = NOW(), updated_at = NOW()
+        \\  FROM sel s
+        \\  WHERE t.id = s.id
+        \\  RETURNING t.id
+        \\)
+        \\SELECT t.id, t.workload_type::text, t.session_id, t.config_json::text, t.workflow_run_id
+        \\FROM workflow_tasks t
+        \\JOIN upd u ON t.id = u.id
+    , .{runner_id});
+
+    if (row) |r| {
+        return TaskAssignment{
+            .task_id = r.get(i32, 0),
+            .workload_type = r.get([]const u8, 1),
+            .session_id = r.get(?[]const u8, 2),
+            .config_json = r.get(?[]const u8, 3),
+            .workflow_run_id = r.get(?i32, 4),
+        };
+    }
+    return null;
+}
+
+/// Assign a compatible available runner for a specific task (push-based)
+/// Returns runner_id if assigned, null if none available
+pub fn assignRunnerForTask(
+    pool: *Pool,
+    task_id: i32,
+) !?i32 {
+    const row = try pool.row(
+        \\WITH t AS (
+        \\  SELECT COALESCE(required_labels, '[]'::jsonb) AS req FROM workflow_tasks WHERE id = $1
+        \\), a AS (
+        \\  SELECT r.id
+        \\  FROM runner_pool r, t
+        \\  WHERE r.status = 'available'
+        \\    AND r.last_heartbeat > NOW() - INTERVAL '30 seconds'
+        \\    AND (jsonb_array_length(t.req) = 0 OR COALESCE(r.labels, '[]'::jsonb) @> t.req)
+        \\  ORDER BY r.registered_at
+        \\  FOR UPDATE SKIP LOCKED
+        \\  LIMIT 1
+        \\), r_upd AS (
+        \\  UPDATE runner_pool r
+        \\  SET status = 'claimed', claimed_at = NOW(), claimed_by_task_id = $1
+        \\  FROM a
+        \\  WHERE r.id = a.id
+        \\  RETURNING r.id
+        \\)
+        \\UPDATE workflow_tasks t2
+        \\SET status = 'assigned', assigned_runner_id = (SELECT id FROM r_upd), assigned_at = NOW(), updated_at = NOW()
+        \\WHERE t2.id = $1 AND (SELECT id FROM r_upd) IS NOT NULL
+        \\RETURNING (SELECT id FROM r_upd) AS runner_id
+    , .{task_id});
+
+    if (row) |r| return r.get(?i32, 0);
+    return null;
+}
+
+pub fn markTaskRunning(pool: *Pool, task_id: i32) !void {
+    _ = try pool.exec(
+        \\UPDATE workflow_tasks
+        \\SET status = 'running', started_at = COALESCE(started_at, NOW()), updated_at = NOW()
+        \\WHERE id = $1 AND status IN ('assigned','running')
+    , .{task_id});
+}
+
+pub fn completeWorkflowTask(
+    pool: *Pool,
+    task_id: i32,
+    success: bool,
+    error_message: ?[]const u8,
+) !void {
+    const status = if (success) "completed" else "failed";
+    _ = try pool.exec(
+        \\UPDATE workflow_tasks
+        \\SET status = $2, completed_at = NOW(), error_message = $3, updated_at = NOW()
+        \\WHERE id = $1
+    , .{ task_id, status, error_message });
+}
+
+/// Release runner claimed for a task back to available
+pub fn releaseRunnerByTask(pool: *Pool, task_id: i32) !void {
+    _ = try pool.exec(
+        \\UPDATE runner_pool
+        \\SET status = 'available', claimed_at = NULL, claimed_by_task_id = NULL, last_heartbeat = NOW()
+        \\WHERE claimed_by_task_id = $1
+    , .{task_id});
+}
+
+/// Requeue tasks assigned to stale/terminated/missing runners; return count
+pub fn requeueStuckTasks(pool: *Pool) !i32 {
+    var total: i32 = 0;
+    total += @intCast(try pool.exec(
+        \\UPDATE workflow_tasks t
+        \\SET status = 'pending', assigned_runner_id = NULL, assigned_at = NULL,
+        \\    started_at = NULL, updated_at = NOW()
+        \\FROM runner_pool r
+        \\WHERE t.assigned_runner_id = r.id
+        \\  AND t.status IN ('assigned','running')
+        \\  AND (r.status = 'terminated' OR r.last_heartbeat < NOW() - INTERVAL '60 seconds')
+    , .{}));
+
+    total += @intCast(try pool.exec(
+        \\UPDATE workflow_tasks t
+        \\SET status = 'pending', assigned_runner_id = NULL, assigned_at = NULL,
+        \\    started_at = NULL, updated_at = NOW()
+        \\WHERE t.status IN ('assigned','running')
+        \\  AND t.assigned_runner_id IS NOT NULL
+        \\  AND NOT EXISTS (SELECT 1 FROM runner_pool r WHERE r.id = t.assigned_runner_id)
+    , .{}));
+
+    return total;
+}
+
+/// Release claimed runners that are no longer backing an assigned/running task
+pub fn releaseOrphanedRunners(pool: *Pool) !i32 {
+    return @intCast(try pool.exec(
+        \\UPDATE runner_pool r
+        \\SET status = 'available', claimed_at = NULL, claimed_by_task_id = NULL, last_heartbeat = NOW()
+        \\WHERE r.status = 'claimed'
+        \\  AND (
+        \\    r.claimed_by_task_id IS NULL OR
+        \\    NOT EXISTS (
+        \\      SELECT 1 FROM workflow_tasks t
+        \\      WHERE t.id = r.claimed_by_task_id AND t.status IN ('assigned','running')
+        \\    )
+        \\  )
     , .{}));
 }

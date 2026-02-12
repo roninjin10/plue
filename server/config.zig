@@ -7,11 +7,24 @@ pub const Config = struct {
     jwt_secret: []const u8,
     cors_origins: []const []const u8,
     is_production: bool,
+    // Base URL used to build callback links returned to runners
+    public_base_url: []const u8,
+    // Local dev shortcut: run workflows synchronously in-process instead of queue
+    local_dev_sync: bool,
 
     // SSH Server Configuration
     ssh_enabled: bool,
     ssh_host: []const u8,
     ssh_port: u16,
+    // SSH file/config paths
+    ssh_host_key_path: []const u8,
+    ssh_host_key_ed25519_path: []const u8,
+    ssh_scripts_dir: []const u8,
+    // SSH users
+    // login user: the account that owns repos and executes forced git commands
+    ssh_login_user: []const u8,
+    // user under which AuthorizedKeysCommand runs (often same as login user)
+    ssh_authorized_keys_user: []const u8,
 
     // SSH Security Configuration
     ssh_max_connections: u32,
@@ -68,6 +81,11 @@ pub fn load() Config {
             "http://localhost:3000",
         },
         .is_production = is_production,
+        .public_base_url = std.posix.getenv("PLUE_PUBLIC_BASE_URL") orelse "",
+        .local_dev_sync = blk: {
+            const v = std.posix.getenv("PLUE_LOCAL_DEV_SYNC") orelse "false";
+            break :blk std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
+        },
         .ssh_enabled = blk: {
             const enabled = std.posix.getenv("SSH_ENABLED") orelse "false";
             break :blk std.mem.eql(u8, enabled, "true") or std.mem.eql(u8, enabled, "1");
@@ -77,6 +95,14 @@ pub fn load() Config {
             // Default to port 22 for Cloudflare Spectrum compatibility
             const port_str = std.posix.getenv("SSH_PORT") orelse "22";
             break :blk std.fmt.parseInt(u16, port_str, 10) catch 22;
+        },
+        .ssh_host_key_path = std.posix.getenv("PLUE_HOSTKEY_RSA") orelse "data/ssh_host_key",
+        .ssh_host_key_ed25519_path = std.posix.getenv("PLUE_HOSTKEY_ED25519") orelse "data/ssh_host_ed25519",
+        .ssh_scripts_dir = std.posix.getenv("PLUE_SCRIPTS_DIR") orelse "server/scripts",
+        .ssh_login_user = std.posix.getenv("SSH_LOGIN_USER") orelse "git",
+        .ssh_authorized_keys_user = blk: {
+            const v = std.posix.getenv("SSH_AUTHORIZED_KEYS_USER");
+            break :blk v orelse (std.posix.getenv("SSH_LOGIN_USER") orelse "git");
         },
         // SSH Security Configuration
         .ssh_max_connections = blk: {

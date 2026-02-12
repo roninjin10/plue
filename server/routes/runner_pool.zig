@@ -16,6 +16,7 @@ const std = @import("std");
 const httpz = @import("httpz");
 const Context = @import("../main.zig").Context;
 const workflows = @import("../workflows/mod.zig");
+const db = @import("db");
 
 const log = std.log.scoped(.runner_pool_routes);
 
@@ -35,6 +36,7 @@ pub fn register(ctx: *Context, req: *httpz.Request, res: *httpz.Response) !void 
         pod_name: []const u8,
         pod_ip: []const u8,
         node_name: ?[]const u8 = null,
+        labels: ?[]const []const u8 = null,
     }, ctx.allocator, body, .{}) catch {
         res.status = 400;
         try res.writer().writeAll("{\"error\":\"Invalid JSON\"}");
@@ -60,7 +62,7 @@ pub fn register(ctx: *Context, req: *httpz.Request, res: *httpz.Response) !void 
     var pool = workflows.RunnerPool.init(ctx.allocator, ctx.pool);
 
     // Register runner
-    const runner_id = pool.registerRunner(v.pod_name, v.pod_ip, v.node_name) catch |err| {
+    const runner_id = pool.registerRunner(v.pod_name, v.pod_ip, v.node_name, v.labels) catch |err| {
         log.err("Failed to register runner {s}: {}", .{ v.pod_name, err });
         res.status = 500;
         try res.writer().writeAll("{\"error\":\"Failed to register runner\"}");
@@ -109,6 +111,33 @@ pub fn heartbeat(ctx: *Context, req: *httpz.Request, res: *httpz.Response) !void
         try res.writer().writeAll("{\"error\":\"Failed to update heartbeat\"}");
         return;
     };
+
+    // Optionally accept labels in heartbeat body to refresh runner labels
+    if (req.body()) |hb_body| {
+        const parsed = std.json.parseFromSlice(struct { labels: ?[]const []const u8 = null }, ctx.allocator, hb_body, .{}) catch null;
+        if (parsed) |p| {
+            defer p.deinit();
+            if (p.value.labels) |arr| {
+                // Encode and persist
+                var buf: [2048]u8 = undefined;
+                var fbs = std.io.fixedBufferStream(&buf);
+                const w = fbs.writer();
+                try w.writeByte('[');
+                var count: usize = 0;
+                for (arr) |lab| {
+                    if (lab.len == 0) continue;
+                    if (count > 0) try w.writeByte(',');
+                    try std.json.stringify(lab, .{}, w);
+                    count += 1;
+                }
+                try w.writeByte(']');
+                const labels_json = fbs.getWritten();
+                db.workflows.updateRunnerLabels(ctx.pool, runner_id, labels_json) catch |e| {
+                    log.err("Failed to update runner labels on heartbeat: {}", .{e});
+                };
+            }
+        }
+    }
 
     try res.writer().writeAll("{\"ok\":true}");
 }

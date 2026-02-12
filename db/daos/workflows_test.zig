@@ -308,3 +308,45 @@ test "llm_usage CRUD" {
     try std.testing.expectEqual(@as(i32, 500), usage[0].output_tokens);
     try std.testing.expectEqual(@as(i32, 1500), usage[0].latency_ms);
 }
+
+test "workflow_tasks label matching and pull assignment" {
+    const allocator = std.testing.allocator;
+
+    _ = std.posix.getenv("TEST_DATABASE_URL") orelse {
+        std.debug.print("Skipping test: TEST_DATABASE_URL not set\n", .{});
+        return error.SkipZigTest;
+    };
+
+    const pool = try pg.Pool.init(allocator, .{
+        .size = 1,
+        .connect = .{ .host = "localhost", .port = 54321 },
+        .auth = .{ .database = "plue_test", .username = "postgres", .password = "password", .timeout = 5_000 },
+    });
+    defer pool.deinit();
+
+    // Insert a runner with labels ["gpu","linux"]
+    const rid_row = try pool.row(
+        \\INSERT INTO runner_pool (pod_name, pod_ip, labels, status, registered_at, last_heartbeat)
+        \\VALUES ('test-runner-1','10.0.0.1','["gpu","linux"]'::jsonb,'available', NOW(), NOW())
+        \\RETURNING id
+    , .{});
+    const runner_id = rid_row.?.get(i32, 0);
+    defer _ = pool.exec("DELETE FROM runner_pool WHERE id=$1", .{runner_id}) catch {};
+
+    // Create a workflow run to attach tasks (or null)
+    const run_id = try workflows.createWorkflowRun(pool, null, "manual", "{}", null);
+    defer _ = pool.exec("DELETE FROM workflow_runs WHERE id=$1", .{run_id}) catch {};
+
+    // Create two tasks: one requires gpu, one requires windows
+    const t_gpu = try workflows.createWorkflowTask(pool, "agent", run_id, null, 1, "[\"gpu\"]", "{}");
+    defer _ = pool.exec("DELETE FROM workflow_tasks WHERE id=$1", .{t_gpu}) catch {};
+    const t_win = try workflows.createWorkflowTask(pool, "agent", run_id, null, 1, "[\"windows\"]", "{}");
+    defer _ = pool.exec("DELETE FROM workflow_tasks WHERE id=$1", .{t_win}) catch {};
+
+    // Pull-path only: runner should claim a compatible task
+
+    // Pull-path: runner should claim the gpu task
+    const claim = try workflows.claimPendingTaskForRunner(pool, runner_id);
+    try std.testing.expect(claim != null);
+    try std.testing.expectEqual(t_gpu, claim.?.task_id);
+}

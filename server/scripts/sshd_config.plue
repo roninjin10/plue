@@ -24,6 +24,7 @@ HostKey /var/lib/plue/ssh_host_ed25519_key
 
 # Authentication
 PubkeyAuthentication yes
+AuthenticationMethods publickey
 PasswordAuthentication no
 ChallengeResponseAuthentication no
 UsePAM no
@@ -32,13 +33,14 @@ UsePAM no
 # The script delegates to `plue ssh authorized-keys <username>` which emits
 # lines like: command="plue ssh serv key-<id>",restrict,... <public-key>
 AuthorizedKeysCommand /opt/plue/scripts/authorized_keys_command.sh
-AuthorizedKeysCommandUser git
+AuthorizedKeysCommandUser ${SSH_AUTHORIZED_KEYS_USER}
+AuthorizedKeysFile none
 
 # Do NOT set a global ForceCommand here; each key line carries its own
 # forced command for strict per-key authorization.
 
-# Only allow 'git' user
-AllowUsers git
+# Only allow the configured login user
+AllowUsers ${SSH_LOGIN_USER}
 
 # Logging
 SyslogFacility AUTH

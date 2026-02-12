@@ -18,7 +18,7 @@ const rate_limit = @import("rate_limit.zig");
 const connection_limit = @import("connection_limit.zig");
 const security_log = @import("security_log.zig");
 const health = @import("health.zig");
-const sshd_bridge = @import("sshd_bridge.zig");
+pub const sshd_bridge = @import("sshd_bridge.zig");
 const db = @import("db");
 
 const log = std.log.scoped(.ssh_server);
@@ -47,6 +47,13 @@ pub const Config = struct {
     initial_ban_duration: i64 = 15 * 60,
     /// Maximum ban duration in seconds (24 hours)
     max_ban_duration: i64 = 24 * 60 * 60,
+    /// Directory containing SSH helper scripts (authorized_keys_command.sh)
+    /// When empty, falls back to env PLUE_SCRIPTS_DIR or 'server/scripts'
+    scripts_dir: []const u8 = "server/scripts",
+    /// Login user (owner of repos, e.g. 'git')
+    login_user: []const u8 = "git",
+    /// User for AuthorizedKeysCommand (often same as login_user)
+    authorized_keys_user: []const u8 = "git",
 };
 
 /// SSH Server
@@ -66,6 +73,8 @@ pub const Server = struct {
 
     /// Cleanup thread handle
     cleanup_thread: ?std.Thread = null,
+    /// Active handler threads counter to coordinate shutdown
+    active_handlers: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
 
     pub fn init(allocator: std.mem.Allocator, config: Config, pool: *db.Pool) Server {
         return .{
@@ -117,6 +126,10 @@ pub const Server = struct {
             &self.rate_limiter,
         );
     }
+
+    /// Note on metrics in bridge mode: post-handoff auth-failure counts are
+    /// updated by parsing sshd stderr ("-e") in sshd_bridge. Pre-handoff
+    /// limits (connection/rate) remain fully enforced here.
 
     /// Generate or load SSH host key
     fn ensureHostKey(self: *Server) !void {
@@ -172,16 +185,19 @@ pub const Server = struct {
         // Ensure host key exists
         try self.ensureHostKey();
 
+        // Preflight is performed in main() to gate enabling SSH. Avoid duplicating
+        // checks here to keep a single source of truth for enable/disable semantics.
+
         // Parse address
         const addr = try std.net.Address.parseIp(self.config.host, self.config.port);
 
         // Create TCP listener
-        const listener = try addr.listen(.{
+        self.listener = try addr.listen(.{
             .reuse_address = true,
             .kernel_backlog = 128,
         });
 
-        self.listener = listener;
+        const listener_ptr: *std.net.Server = &self.listener.?;
         self.running = true;
         self.start_time = std.time.timestamp();
 
@@ -197,21 +213,26 @@ pub const Server = struct {
             self.config.max_auth_failures,
             self.config.max_connections,
         });
-        log.info("Note: This is a simplified implementation for git operations", .{});
-        log.info("For production use, consider using a full SSH implementation", .{});
+        log.info("Mode: external sshd bridge active (sshd -i); native SSH disabled", .{});
 
         // Accept connections
         while (self.running) {
-            const connection = self.listener.?.accept() catch |err| {
+            const connection = listener_ptr.accept() catch |err| {
+                if (!self.running) break; // listener likely closed during shutdown
                 log.err("Accept failed: {}", .{err});
+                // Avoid tight loop on persistent failure
+                std.time.sleep(10 * std.time.ns_per_ms);
                 continue;
             };
 
             // Handle connection in a new thread
-            const thread = try std.Thread.spawn(.{}, handleConnectionSecure, .{
-                self,
-                connection,
-            });
+            self.active_handlers.fetchAdd(1, .acq_rel);
+            const thread = try std.Thread.spawn(.{}, struct {
+                fn run(srv: *Server, conn: std.net.Server.Connection) void {
+                    defer srv.active_handlers.fetchSub(1, .acq_rel);
+                    handleConnectionSecure(srv, conn);
+                }
+            }.run, .{ self, connection });
             thread.detach();
         }
     }
@@ -236,7 +257,11 @@ pub const Server = struct {
         self.running = false;
         if (self.listener) |*listener| {
             listener.deinit();
-            self.listener = null;
+        }
+        // Wait for active handlers to drain (max 5 seconds)
+        var waited_ns: u64 = 0;
+        while (self.active_handlers.load(.acquire) > 0 and waited_ns < 5 * std.time.ns_per_s) : (waited_ns += 10 * std.time.ns_per_ms) {
+            std.time.sleep(10 * std.time.ns_per_ms);
         }
     }
 };
@@ -376,6 +401,7 @@ fn handleConnectionInner(
                     prebuffer = data[info.header_length..];
                 } else {
                     log.warn("Invalid or incomplete PROXY header; closing connection to avoid corrupting SSH handshake", .{});
+                    security_log.logConnectionRejectedLimit(ip, "malformed PROXY header");
                     return; // Do not forward partial header to sshd
                 }
             } else {
@@ -394,6 +420,10 @@ fn handleConnectionInner(
             prebuffer,
             server.config.host_key_path,
             server.config.host_key_ed25519_path,
+            server.config.scripts_dir,
+            server.config.login_user,
+            server.config.authorized_keys_user,
+            &server.rate_limiter,
         ) catch |e| {
             log.err("sshd bridge failed: {}", .{e});
         };
@@ -404,29 +434,9 @@ fn handleConnectionInner(
 
 // Extract IP address from socket address
 fn extractIpAddress(address: std.net.Address, buf: []u8) []const u8 {
-    switch (address.any.family) {
-        std.posix.AF.INET => {
-            const bytes = @as(*const [4]u8, @ptrCast(&address.in.sa.addr));
-            const result = std.fmt.bufPrint(buf, "{}.{}.{}.{}", .{
-                bytes[0], bytes[1], bytes[2], bytes[3],
-            }) catch return "unknown";
-            return result;
-        },
-        std.posix.AF.INET6 => {
-            // Simplified IPv6 formatting - use first 16 bytes
-            const bytes = @as(*const [16]u8, @ptrCast(&address.in6.sa.addr));
-            const result = std.fmt.bufPrint(buf, "{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}", .{
-                bytes[0],  bytes[1],  bytes[2],  bytes[3],
-                bytes[4],  bytes[5],  bytes[6],  bytes[7],
-                bytes[8],  bytes[9],  bytes[10], bytes[11],
-                bytes[12], bytes[13], bytes[14], bytes[15],
-            }) catch return "unknown";
-            return result;
-        },
-        else => {
-            return "unknown";
-        },
-    }
+    var fbs = std.io.fixedBufferStream(buf);
+    address.format(.{}, fbs.writer()) catch return "unknown";
+    return std.mem.trimRight(u8, fbs.getWritten(), "\x00\n\r ");
 }
 
 /// Handle SSH protocol with security integration
@@ -534,75 +544,12 @@ fn handleConnection(
         return;
     }
 
-    // Simple protocol handler
-    // In a real implementation, this would handle:
-    // - Key exchange (KEX)
-    // - Authentication (publickey)
-    // - Channel management
-    // - Exec requests
-    //
-    // For now, we provide a minimal implementation that demonstrates the architecture.
-    // For production use, integrate with libssh2 or use a pure Zig implementation like MiSSHod.
-
-    handleProtocol(allocator, pool, &conn) catch |err| {
-        log.err("Protocol error: {}", .{err});
-    };
-
-    log.info("SSH connection closed from {s}", .{conn.getClientIp()});
+    // Legacy native path is disabled; all connections are handled by the bridge above.
+    return;
 }
 
 /// Handle SSH protocol after version exchange
-fn handleProtocol(
-    allocator: std.mem.Allocator,
-    pool: *db.Pool,
-    conn: *Connection,
-) !void {
-    _ = allocator;
-    _ = pool;
-    _ = conn;
-
-    // TODO: Implement SSH protocol handling
-    // This is a complex undertaking that involves:
-    //
-    // 1. Key Exchange (KEX):
-    //    - Send SSH_MSG_KEXINIT with supported algorithms
-    //    - Perform Diffie-Hellman key exchange
-    //    - Derive session keys
-    //    - Send SSH_MSG_NEWKEYS
-    //
-    // 2. Service Request:
-    //    - Receive SSH_MSG_SERVICE_REQUEST for "ssh-userauth"
-    //    - Send SSH_MSG_SERVICE_ACCEPT
-    //
-    // 3. Authentication:
-    //    - Receive SSH_MSG_USERAUTH_REQUEST with publickey method
-    //    - Validate username is "git"
-    //    - Verify public key signature
-    //    - Look up key in database using auth.authenticatePublicKey
-    //    - Send SSH_MSG_USERAUTH_SUCCESS or SSH_MSG_USERAUTH_FAILURE
-    //
-    // 4. Channel Management:
-    //    - Receive SSH_MSG_CHANNEL_OPEN for "session"
-    //    - Send SSH_MSG_CHANNEL_OPEN_CONFIRMATION
-    //    - Handle SSH_MSG_CHANNEL_REQUEST for "exec"
-    //    - Execute git command using session.executeGitCommand
-    //    - Send command output via SSH_MSG_CHANNEL_DATA
-    //    - Send SSH_MSG_CHANNEL_EOF and SSH_MSG_CHANNEL_CLOSE
-    //
-    // For a production-ready implementation, consider using:
-    // - libssh2 with Zig bindings
-    // - MiSSHod (https://github.com/ringtailsoftware/misshod)
-    // - ZSSH (https://git.sr.ht/~mulling/zssh)
-
-    log.warn("Full SSH protocol implementation is not yet complete", .{});
-    log.warn("Consider using one of these approaches:", .{});
-    log.warn("  1. Wrap OpenSSH sshd with authorized_keys_command", .{});
-    log.warn("  2. Use libssh2 with Zig bindings", .{});
-    log.warn("  3. Use MiSSHod pure Zig SSH library", .{});
-    log.warn("  4. Use ZSSH pure Zig SSH library", .{});
-
-    return error.NotImplemented;
-}
+// Native SSH protocol handler intentionally removed while bridge mode is the only supported path.
 
 /// Read a line from the connection
 fn readLine(conn: *Connection, buffer: []u8) ![]const u8 {
@@ -625,51 +572,6 @@ fn readLine(conn: *Connection, buffer: []u8) ![]const u8 {
 
 /// Alternative: Create authorized_keys_command wrapper
 /// This is a more practical approach that leverages OpenSSH
-pub fn createAuthorizedKeysCommand(allocator: std.mem.Allocator, pool: *db.Pool) !void {
-    _ = allocator;
-    _ = pool;
-
-    // Create a script that queries the database for authorized keys
-    const script =
-        \\#!/usr/bin/env bash
-        \\# Plue SSH Authorized Keys Command
-        \\# Usage: authorized_keys_command <username>
-        \\
-        \\set -euo pipefail
-        \\
-        \\USERNAME="$1"
-        \\
-        \\# Only allow 'git' user
-        \\if [ "$USERNAME" != "git" ]; then
-        \\    exit 1
-        \\fi
-        \\
-        \\# Query database for public keys
-        \\psql "$DATABASE_URL" -t -A -c "
-        \\    SELECT public_key
-        \\    FROM ssh_keys k
-        \\    JOIN users u ON k.user_id = u.id
-        \\    WHERE u.is_active = true
-        \\    ORDER BY k.id
-        \\"
-    ;
-
-    const script_path = "scripts/authorized_keys_command.sh";
-
-    // Create scripts directory
-    try std.fs.cwd().makePath("scripts");
-
-    // Write script
-    var file = try std.fs.cwd().createFile(script_path, .{ .mode = 0o755 });
-    defer file.close();
-
-    try file.writeAll(script);
-
-    log.info("Created authorized_keys_command script at {s}", .{script_path});
-    log.info("Configure OpenSSH sshd_config:", .{});
-    log.info("  AuthorizedKeysCommand /path/to/{s}", .{script_path});
-    log.info("  AuthorizedKeysCommandUser git", .{});
-}
 
 test "Server init" {
     const allocator = std.testing.allocator;

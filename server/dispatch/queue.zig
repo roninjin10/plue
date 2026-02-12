@@ -39,7 +39,12 @@ pub const WorkloadRequest = struct {
     workflow_run_id: ?i32,
     session_id: ?[]const u8,
     priority: Priority,
+    // Optional JSON config to pass to the runner. For workflow tasks
+    // we will populate per-step configs automatically.
     config_json: ?[]const u8,
+    // Optional label requirements for runner selection. If null, defaults
+    // to empty array []. Labels are enforced both in push- and pull-paths.
+    required_labels: ?[]const []const u8 = null,
 };
 
 /// Runner information
@@ -69,43 +74,170 @@ pub fn submitWorkload(
         @intFromEnum(request.priority),
     });
 
-    // TODO(workflows): Implement proper task queue with workflow_tasks table
-    // For MVP, we just update the workflow_run status to indicate it's queued
-    // In production, this would:
-    // 1. Create workflow_tasks records for each step in the workflow plan
-    // 2. Assign to warm pool runners or create K8s Jobs
-    // 3. Return the task_id for tracking
+    const workload_type_txt = switch (request.type) {
+        .agent => "agent",
+        .workflow => "workflow",
+    };
 
-    const run_id = request.workflow_run_id orelse return error.MissingWorkflowRunId;
+    // Encode labels to JSON once for reuse (dynamic, no fixed buffer limits)
+    const labels_json: ?[]const u8 = blk: {
+        if (request.required_labels) |labels| {
+            var list = std.ArrayList(u8){};
+            defer list.deinit(allocator);
+            const w = list.writer(allocator);
+            try w.writeByte('[');
+            var count: usize = 0;
+            for (labels) |lab| {
+                if (lab.len == 0) continue;
+                if (count > 0) try w.writeByte(',');
+                try std.json.stringify(lab, .{}, w);
+                count += 1;
+            }
+            try w.writeByte(']');
+            break :blk try list.toOwnedSlice(allocator);
+        }
+        break :blk null;
+    };
+    defer if (labels_json) |lj| allocator.free(lj);
 
-    // Update workflow_run to "running" status
-    const query =
-        \\UPDATE workflow_runs
-        \\SET status = 'running', started_at = NOW()
-        \\WHERE id = $1
-        \\RETURNING id
-    ;
+    if (request.type == .workflow and request.workflow_run_id) |run_id| {
+        // Single-job approach: create ONE task with full workflow payload
+        const cfg_json = try buildWorkflowConfigJson(allocator, pool, run_id);
+        defer allocator.free(cfg_json);
 
-    const result = try pool.query(query, .{run_id});
-    defer result.deinit();
+        const tid = try db.workflows.createWorkflowTask(
+            pool,
+            workload_type_txt,
+            request.workflow_run_id,
+            request.session_id,
+            @intFromEnum(request.priority),
+            labels_json,
+            cfg_json,
+        );
 
-    if (try result.next()) |row| {
-        const task_id = row.get(i32, 0);
-        log.info("Queued workflow run {d} (simulated task_id={d})", .{ run_id, task_id });
+        const cfg = @import("../config.zig").load();
+        if (cfg.local_dev_sync) executeWorkflowAsync(allocator, pool, run_id);
+        return tid;
+    } else {
+        // Agent or non-workflow task
+        // Ensure config includes explicit type for the Python runner
+        const agent_cfg = blk: {
+            if (request.config_json) |cj| {
+                // If caller already provided, ensure it contains a type; if not, wrap it
+                if (std.mem.indexOf(u8, cj, "\"type\"")) |_| {
+                    break :blk cj;
+                }
+                var list = std.ArrayList(u8){};
+                defer list.deinit(allocator);
+                const w = list.writer(allocator);
+                try w.writeAll("{\"type\":\"agent\",\"config\":");
+                try w.writeAll(cj);
+                try w.writeByte('}');
+                break :blk try list.toOwnedSlice(allocator);
+            }
+            break :blk "{\"type\":\"agent\"}";
+        };
 
-        // For MVP local development: execute synchronously in the request thread.
-        // This avoids connection pool exhaustion that occurs when a detached thread
-        // competes with HTTP request handlers for the limited connection pool.
-        // In production, this would use: tryAssignRunner(pool, task_id)
-        //
-        // Note: Synchronous execution blocks the HTTP response until the workflow
-        // completes, but for local dev this is acceptable and more reliable.
-        executeWorkflowAsync(allocator, pool, run_id);
+        const task_id = try db.workflows.createWorkflowTask(
+            pool,
+            workload_type_txt,
+            request.workflow_run_id,
+            request.session_id,
+            @intFromEnum(request.priority),
+            labels_json,
+            agent_cfg,
+        );
+        return task_id;
+    }
+}
 
-        return task_id; // Return run_id as task_id for now
+/// Insert workflow_tasks for each step in the workflow run's plan.
+/// Build the Python-runner workflow config JSON for a given run_id.
+/// Shape: {"type":"workflow", "steps":[ ... ]}
+fn buildWorkflowConfigJson(
+    allocator: std.mem.Allocator,
+    pool: *db.Pool,
+    run_id: i32,
+) ![]const u8 {
+    // Resolve workflow definition for the run
+    const row = try pool.row(
+        \\SELECT workflow_definition_id FROM workflow_runs WHERE id = $1
+    , .{run_id});
+    if (row == null) return error.WorkflowRunNotFound;
+    const def_id = row.?.get(?i32, 0) orelse return error.WorkflowDefinitionNotFound;
+
+    const def = try db.workflows.getWorkflowDefinition(pool, def_id) orelse return error.WorkflowDefinitionNotFound;
+
+    // Parse plan JSON
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const parsed = try std.json.parseFromSlice(
+        workflows.plan.WorkflowDefinition,
+        a,
+        def.plan,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer parsed.deinit();
+
+    var out = std.ArrayList(u8){};
+    errdefer out.deinit(allocator);
+    const w = out.writer(allocator);
+
+    try w.writeAll("{\"type\":\"workflow\",\"steps\":[");
+
+    var first: bool = true;
+    for (parsed.value.steps) |step| {
+        if (!first) try w.writeByte(',');
+        first = false;
+
+        switch (step.\@"type") {
+            .shell => {
+                // Map shell step to runner's {type:"run", run:"<cmd>", env:{...}}
+                const cfg = step.config.data;
+                var cmd: ?[]const u8 = null;
+                var env_json: ?[]const u8 = null;
+                if (cfg == .object) {
+                    if (cfg.object.get("cmd")) |v| if (v == .string) cmd = v.string;
+                    if (cfg.object.get("env")) |v| {
+                        // Serialize env object directly as JSON
+                        const json_util = @import("../lib/json.zig");
+                        env_json = json_util.valueToString(allocator, v) catch null;
+                    }
+                }
+                try w.writeByte('{');
+                // name
+                try w.writeAll("\"name\":");
+                try std.json.stringify(step.name, .{}, w);
+                // type
+                try w.writeAll(",\"type\":\"run\"");
+                // run command
+                if (cmd) |c| {
+                    try w.writeAll(",\"run\":");
+                    try std.json.stringify(c, .{}, w);
+                } else {
+                    // Fallback: no cmd provided, emit a harmless echo
+                    try w.writeAll(",\"run\":\"/bin/echo Missing cmd in shell step\"");
+                }
+                // env if present
+                if (env_json) |ej| {
+                    try w.writeAll(",\"env\":");
+                    try w.writeAll(ej);
+                    allocator.free(ej);
+                }
+                try w.writeByte('}');
+            },
+            else => {
+                // Unsupported step types: emit a no-op log via echo
+                try w.writeAll("{\"name\":");
+                try std.json.stringify(step.name, .{}, w);
+                try w.writeAll(",\"type\":\"run\",\"run\":\"/bin/echo Skipping unsupported step type\"}");
+            },
+        }
     }
 
-    return error.FailedToCreateTask;
+    try w.writeAll("]}");
+    return try out.toOwnedSlice(allocator);
 }
 
 /// Execute a workflow asynchronously (for local development)
@@ -213,137 +345,94 @@ fn executeWorkflow(allocator: std.mem.Allocator, pool: *db.Pool, run_id: i32) !v
 }
 
 /// Try to assign a warm runner to a task
+/// Try to assign a warm runner to a task (push path)
+/// Push-path assignment is disabled. Runners pull tasks via /internal/runners/register.
 pub fn tryAssignRunner(pool: *db.Pool, task_id: i32) !void {
-    // Atomically claim an available runner
-    const claim_query =
-        \\WITH claimed AS (
-        \\    SELECT id, pod_name, pod_ip
-        \\    FROM runner_pool
-        \\    WHERE status = 'available'
-        \\    ORDER BY registered_at
-        \\    FOR UPDATE SKIP LOCKED
-        \\    LIMIT 1
-        \\)
-        \\UPDATE runner_pool r
-        \\SET status = 'claimed',
-        \\    claimed_at = NOW(),
-        \\    claimed_by_task_id = $1
-        \\FROM claimed c
-        \\WHERE r.id = c.id
-        \\RETURNING r.id, r.pod_name, r.pod_ip
-    ;
-
-    const result = try pool.query(claim_query, .{task_id});
-    defer result.deinit();
-
-    if (try result.next()) |row| {
-        const runner_id = row.get(i32, 0);
-        const pod_name = row.get([]const u8, 1);
-        const pod_ip = row.get([]const u8, 2);
-
-        log.info("Claimed runner {d} ({s}) for task {d}", .{
-            runner_id,
-            pod_name,
-            task_id,
-        });
-
-        // Notify the runner to start (via HTTP callback)
-        notifyRunner(pod_ip, task_id) catch |err| {
-            log.err("Failed to notify runner: {}", .{err});
-        };
-    } else {
-        return error.NoAvailableRunner;
-    }
-}
-
-/// Notify a runner to start a task
-fn notifyRunner(pod_ip: []const u8, task_id: i32) !void {
-    // Make HTTP request to runner's assignment endpoint
-    const allocator = std.heap.page_allocator;
-    var client = std.http.Client{ .allocator = allocator };
-    defer client.deinit();
-
-    const url = try std.fmt.allocPrint(allocator, "http://{s}:8080/assign", .{pod_ip});
-    defer allocator.free(url);
-
-    const body = try std.fmt.allocPrint(allocator, "{{\"task_id\":{d}}}", .{task_id});
-    defer allocator.free(body);
-
-    const result = client.fetch(.{
-        .location = .{ .url = url },
-        .method = .POST,
-        .payload = body,
-        .headers = .{
-            .content_type = .{ .override = "application/json" },
-        },
-    }) catch {
-        return error.RunnerNotificationFailed;
-    };
-
-    if (result.status != .ok) {
-        return error.RunnerNotificationFailed;
-    }
+    _ = pool;
+    _ = task_id;
+    return error.NoAvailableRunner;
 }
 
 /// Register a runner in the warm pool
-pub fn registerRunner(
-    pool: *db.Pool,
-    pod_name: []const u8,
-    pod_ip: []const u8,
-) !i32 {
-    log.info("Registering runner: {s} ({s})", .{ pod_name, pod_ip });
-
-    // Upsert runner into pool
-    const query =
+// Deprecated register/updateHeartbeat helpers kept temporarily for compatibility with old callers
+pub fn registerRunner(pool: *db.Pool, pod_name: []const u8, pod_ip: []const u8) !i32 {
+    log.warn("queue.registerRunner is deprecated; use RunnerPool DAO via internal routes", .{});
+    const row = try pool.row(
         \\INSERT INTO runner_pool (pod_name, pod_ip, status, registered_at, last_heartbeat)
         \\VALUES ($1, $2, 'available', NOW(), NOW())
-        \\ON CONFLICT (pod_name) DO UPDATE
-        \\SET pod_ip = $2, status = 'available', last_heartbeat = NOW()
+        \\ON CONFLICT (pod_name) DO UPDATE SET pod_ip=$2, status='available', last_heartbeat=NOW()
         \\RETURNING id
-    ;
-
-    const result = try pool.query(query, .{ pod_name, pod_ip });
-    defer result.deinit();
-
-    if (try result.next()) |row| {
-        const runner_id = row.get(i32, 0);
-        return runner_id;
-    }
-
+    , .{ pod_name, pod_ip });
+    if (row) |r| return r.get(i32, 0);
     return error.FailedToRegisterRunner;
 }
 
-/// Update runner heartbeat
 pub fn updateHeartbeat(pool: *db.Pool, pod_name: []const u8) !void {
-    const query =
-        \\UPDATE runner_pool
-        \\SET last_heartbeat = NOW()
-        \\WHERE pod_name = $1
-    ;
-    _ = try pool.query(query, .{pod_name});
+    log.warn("queue.updateHeartbeat is deprecated; prefer /internal/runners/:runner_id/heartbeat", .{});
+    _ = try pool.exec(
+        \\UPDATE runner_pool SET last_heartbeat = NOW() WHERE pod_name = $1 AND status != 'terminated'
+    , .{pod_name});
 }
 
 /// Mark task as completed
 pub fn completeTask(pool: *db.Pool, task_id: i32, success: bool) !void {
-    const status = if (success) "completed" else "failed";
+    try db.workflows.completeWorkflowTask(pool, task_id, success, null);
+    try db.workflows.releaseRunnerByTask(pool, task_id);
 
-    const query =
-        \\UPDATE workflow_runs
-        \\SET status = $1, completed_at = NOW()
-        \\WHERE id = $2
-    ;
-    _ = try pool.query(query, .{ status, task_id });
-
-    // Release the runner back to the pool
-    const release_query =
-        \\UPDATE runner_pool
-        \\SET status = 'available', claimed_at = NULL, claimed_by_task_id = NULL
-        \\WHERE claimed_by_task_id = $1
-    ;
-    _ = try pool.query(release_query, .{task_id});
-
-    log.info("Task {d} completed with status: {s}", .{ task_id, status });
+    const row = try pool.row(
+        \SELECT workflow_run_id FROM workflow_tasks WHERE id = $1
+    , .{task_id});
+    if (row) |r| {
+        if (r.get(?i32, 0)) |run_id| {
+            // Aggregate all tasks for the run
+            const agg = try pool.row(
+                \\SELECT
+                \\  COUNT(*)::int AS total,
+                \\  SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END)::int AS completed,
+                \\  SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END)::int AS failed
+                \\FROM workflow_tasks WHERE workflow_run_id = $1
+            , .{run_id});
+            if (agg) |a| {
+                const total = a.get(i32, 0);
+                const completed = a.get(i32, 1);
+                const failed = a.get(i32, 2);
+                if (failed > 0) {
+                    _ = try pool.exec(
+                        \\UPDATE workflow_runs SET status = 'failed', completed_at = NOW() WHERE id = $1
+                    , .{ run_id });
+                } else if (total > 0 and completed == total) {
+                    _ = try pool.exec(
+                        \\UPDATE workflow_runs SET status = 'completed', completed_at = NOW() WHERE id = $1
+                    , .{ run_id });
+                } else {
+                    // Ensure run is at least marked running once tasks start/finish
+                    _ = try pool.exec(
+                        \\UPDATE workflow_runs SET status = 'running' WHERE id = $1 AND status = 'pending'
+                    , .{ run_id });
+                }
+            }
+        }
+    }
+    log.info("Task {d} completed (success={})", .{ task_id, success });
 }
+
+/// Mark task failed with error message
+pub fn completeTaskWithError(pool: *db.Pool, task_id: i32, message: []const u8) !void {
+    try db.workflows.completeWorkflowTask(pool, task_id, false, message);
+    try db.workflows.releaseRunnerByTask(pool, task_id);
+
+    const row = try pool.row(
+        \SELECT workflow_run_id FROM workflow_tasks WHERE id = $1
+    , .{task_id});
+    if (row) |r| {
+        if (r.get(?i32, 0)) |run_id| {
+            _ = try pool.exec(
+                \UPDATE workflow_runs SET status = 'failed', error_message = $2, completed_at = NOW() WHERE id = $1
+            , .{ run_id, message });
+        }
+    }
+}
+
 
 /// Get pending task for runner (used in standby mode)
 pub fn getPendingTaskForRunner(
@@ -352,9 +441,14 @@ pub fn getPendingTaskForRunner(
     runner_id: i32,
 ) !?TaskAssignment {
     _ = allocator;
-    _ = pool;
-    _ = runner_id;
-    return null;
+    const claim = try db.workflows.claimPendingTaskForRunner(pool, runner_id) orelse return null;
+    return TaskAssignment{
+        .task_id = claim.task_id,
+        .config_json = claim.config_json,
+        .workload_type = claim.workload_type,
+        .session_id = claim.session_id,
+        .workflow_name = null,
+    };
 }
 
 pub const TaskAssignment = struct {
@@ -377,4 +471,27 @@ test "Priority ordering" {
 test "WorkloadStatus enum" {
     const status: WorkloadStatus = .pending;
     try std.testing.expectEqual(WorkloadStatus.pending, status);
+}
+
+/// Transition a task to running when runner starts sending events
+pub fn markTaskRunning(pool: *db.Pool, task_id: i32) !void {
+    try db.workflows.markTaskRunning(pool, task_id);
+    // If this task is associated with a run, mark the run as running
+    const row = try pool.row(
+        \SELECT workflow_run_id FROM workflow_tasks WHERE id = $1
+    , .{task_id});
+    if (row) |r| {
+        if (r.get(?i32, 0)) |run_id| {
+            _ = try pool.exec(
+                \UPDATE workflow_runs SET status = 'running', started_at = COALESCE(started_at, NOW()) WHERE id = $1 AND status = 'pending'
+            , .{ run_id });
+        }
+    }
+}
+
+/// Requeue tasks with stale/terminated runners and release orphaned claims
+pub fn recoverStuckTasks(pool: *db.Pool) !void {
+    const requeued = try db.workflows.requeueStuckTasks(pool);
+    const released = try db.workflows.releaseOrphanedRunners(pool);
+    log.info("Queue recovery: requeued={d}, released_runners={d}", .{ requeued, released });
 }

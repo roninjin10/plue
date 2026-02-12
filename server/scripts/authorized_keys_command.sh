@@ -22,8 +22,9 @@ set -euo pipefail
 
 USERNAME="$1"
 
-# Only allow 'git' user (like GitHub)
-if [ "$USERNAME" != "git" ]; then
+# Determine allowed login user from env (SSH_AUTHORIZED_KEYS_USER > SSH_LOGIN_USER > git)
+ALLOWED_USER="${SSH_AUTHORIZED_KEYS_USER:-${SSH_LOGIN_USER:-git}}"
+if [ "$USERNAME" != "$ALLOWED_USER" ]; then
     exit 1
 fi
 

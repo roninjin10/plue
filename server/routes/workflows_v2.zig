@@ -245,7 +245,7 @@ pub fn runWorkflow(ctx: *Context, req: *httpz.Request, res: *httpz.Response) !vo
         return;
     };
 
-    // Submit to queue for execution
+    // Submit to queue for execution (now returns a real task_id for workflow runs)
     const task_id = queue.submitWorkload(
         ctx.allocator,
         ctx.pool,
@@ -254,7 +254,7 @@ pub fn runWorkflow(ctx: *Context, req: *httpz.Request, res: *httpz.Response) !vo
             .workflow_run_id = run_id,
             .session_id = null,
             .priority = .normal,
-            .config_json = null, // TODO: Serialize workflow plan as JSON
+            .config_json = null,
         },
     ) catch |err| {
         log.err("Failed to submit workload: {}", .{err});
@@ -266,11 +266,7 @@ pub fn runWorkflow(ctx: *Context, req: *httpz.Request, res: *httpz.Response) !vo
     log.info("Workflow run created: run_id={d}, task_id={d}", .{ run_id, task_id });
 
     res.status = 201;
-    try res.json(.{
-        .run_id = run_id,
-        .task_id = task_id,
-        .status = "queued",
-    }, .{});
+    try res.json(.{ .run_id = run_id, .task_id = task_id, .status = "queued" }, .{});
 }
 
 // ============================================================================

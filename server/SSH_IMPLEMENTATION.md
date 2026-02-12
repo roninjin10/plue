@@ -10,16 +10,16 @@ The SSH implementation provides Git repository access via SSH protocol, similar 
 
 The implementation consists of two approaches:
 
-### 1. Native Zig Implementation (Experimental)
+### 1. Native Zig Implementation (Experimental - Disabled by Default)
 
-Located in `src/ssh/`, this is a native Zig implementation with the following components:
+Located in `server/ssh/`, this is a native Zig implementation with the following components:
 
-- **`src/ssh/types.zig`**: SSH protocol types and constants (RFC 4253, RFC 4252, RFC 4254)
-- **`src/ssh/auth.zig`**: Public key authentication against the database
-- **`src/ssh/session.zig`**: Session handler for `git-upload-pack` and `git-receive-pack`
-- **`src/ssh/server.zig`**: Main SSH server with TCP socket handling
+- **`server/ssh/types.zig`**: SSH protocol types and constants (RFC 4253, RFC 4252, RFC 4254)
+- **`server/ssh/auth.zig`**: Public key authentication against the database
+- **`server/ssh/session.zig`**: Session handler for `git-upload-pack` and `git-receive-pack`
+- **`server/ssh/server.zig`**: Main SSH server with TCP socket handling
 
-**Status**: Basic TCP connection handling implemented. Full SSH protocol implementation requires:
+**Status**: The native path is not active. Plue defaults to the external sshd bridge for production. The native server currently has basic TCP handling only; completing it would require:
 - Key exchange (KEX) with Diffie-Hellman
 - Session key derivation
 - Packet encryption/MAC
@@ -31,7 +31,7 @@ Located in `src/ssh/`, this is a native Zig implementation with the following co
 - [MiSSHod](https://github.com/ringtailsoftware/misshod) - Pure Zig SSH library (experimental)
 - [ZSSH](https://git.sr.ht/~mulling/zssh) - SUSE's Zig SSH implementation (in development)
 
-### 2. OpenSSH Integration (Production-Ready)
+### 2. OpenSSH Integration (Production-Ready, Default)
 
 Located in `scripts/`, this approach leverages OpenSSH's `sshd` for protocol handling while implementing authentication and command execution in Plue.
 
@@ -47,7 +47,7 @@ Located in `scripts/`, this approach leverages OpenSSH's `sshd` for protocol han
 ### Environment Variables
 
 ```bash
-# Enable SSH server (Zig implementation)
+# Enable SSH server (external sshd bridge)
 SSH_ENABLED=true
 
 # SSH server host and port
@@ -83,19 +83,16 @@ CREATE INDEX idx_ssh_keys_user_id ON ssh_keys(user_id);
 
 ## Usage
 
-### Option 1: Native Zig Server (Experimental)
+### Option 1: External sshd Bridge (Default)
 
 ```bash
-# Build the server
 zig build
-
-# Run with SSH enabled
 SSH_ENABLED=true zig build run
 ```
 
-This starts the experimental SSH server on port 2222. Note: Full protocol implementation is not yet complete.
+This starts the SSH TCP acceptor and proxies each SSH connection to `sshd -i` with security checks (PROXY v1, rate/connection limits) enforced before handoff.
 
-### Option 2: OpenSSH Integration (Recommended)
+### Option 2: System OpenSSH Integration (Alternative)
 
 #### Setup
 
@@ -180,6 +177,10 @@ git push origin main
 
 **Post-Push Hook**: After a successful push, the server triggers JJ sync to update the database.
 
+### LFS over SSH
+
+Plue supports `git-lfs-authenticate` over SSH in the ForcedCommand path. When `PLUE_LFS_URL` is set, the JSON `href` points to that base; otherwise it derives from `PLUE_HTTP_URL` (default `http://localhost:4000`). If `PLUE_LFS_TOKEN` is set, the response includes `{"Authorization":"Bearer <token>"}` in `header`.
+
 ## Authentication Flow
 
 1. Client connects via SSH
@@ -238,7 +239,7 @@ sudo tail -f /var/log/plue/git-shell.log
 1. **Complete Native Implementation**: Finish the Zig SSH protocol implementation
 2. **Deploy Keys**: Support read-only deploy keys for CI/CD
 3. **SSH Certificates**: Use SSH certificates instead of public keys
-4. **Git LFS**: Support Git Large File Storage over SSH
+4. **Git LFS**: Native LFS packet streaming over SSH channels (the auth step is implemented via `git-lfs-authenticate`).
 5. **Performance**: Connection pooling and caching for high-traffic scenarios
 6. **Monitoring**: Prometheus metrics for SSH connections and git operations
 

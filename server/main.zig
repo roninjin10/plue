@@ -10,6 +10,8 @@ const session_cleanup = @import("services/session_cleanup.zig");
 const edge_notifier = @import("services/edge_notifier.zig");
 const agent_handler = @import("websocket/agent_handler.zig");
 const workflows = @import("workflows/mod.zig");
+const queue = @import("dispatch/queue.zig");
+const ssh = @import("ssh/server.zig");
 
 const log = std.log.scoped(.server);
 
@@ -112,12 +114,89 @@ pub fn main() !void {
     }, &ctx);
     defer server.deinit();
 
+    // Recover any stuck tasks/runners on startup (best-effort)
+    queue.recoverStuckTasks(ctx.pool) catch |e| {
+        log.err("Task queue recovery failed: {}", .{e});
+    };
+
+    // Start lightweight periodic recovery loop (every 30s)
+    if (true) {
+        _ = try std.Thread.spawn(.{}, struct {
+            fn run(p: *db.Pool) void {
+                while (true) {
+                    queue.recoverStuckTasks(p) catch |e| {
+                        log.err("Periodic queue recovery error: {}", .{e});
+                    };
+                    std.time.sleep(30 * std.time.ns_per_s);
+                }
+            }
+        }.run, .{ctx.pool});
+        log.info("Started periodic task-queue recovery loop (30s)", .{});
+    }
+
     // Configure middleware (applied in order: logger -> security -> cors -> body_limit -> rate_limit -> auth)
     log.info("Configuring middleware...", .{});
     try configureMiddleware(&server);
 
     // Configure routes
     try routes.configure(&server);
+
+    // Optionally start SSH server (bridged via OpenSSH sshd)
+    var ssh_srv_ptr: ?*ssh.Server = null;
+    var ssh_thread: ?std.Thread = null;
+    if (cfg.ssh_enabled) {
+        const ssh_conf: ssh.Config = .{
+            .host = cfg.ssh_host,
+            .port = cfg.ssh_port,
+            .proxy_protocol_enabled = true,
+            .max_connections = cfg.ssh_max_connections,
+            .max_per_ip_connections = cfg.ssh_max_per_ip_connections,
+            .rate_limit_per_minute = cfg.ssh_rate_limit_per_minute,
+            .max_auth_failures = cfg.ssh_max_auth_failures,
+            .initial_ban_duration = cfg.ssh_initial_ban_duration,
+            .max_ban_duration = cfg.ssh_max_ban_duration,
+            .host_key_path = cfg.ssh_host_key_path,
+            .host_key_ed25519_path = cfg.ssh_host_key_ed25519_path,
+            .scripts_dir = cfg.ssh_scripts_dir,
+            .login_user = cfg.ssh_login_user,
+            .authorized_keys_user = cfg.ssh_authorized_keys_user,
+        };
+
+        // Preflight external sshd bridge requirements
+        var ssh_ok = true;
+        ssh.sshd_bridge.preflightCheck(
+            allocator,
+            ssh_conf.scripts_dir,
+            ssh_conf.host_key_path,
+            ssh_conf.host_key_ed25519_path,
+            ssh_conf.login_user,
+            ssh_conf.authorized_keys_user,
+        ) catch |e| {
+            std.log.err("SSH preflight failed: {}. SSH will be disabled.", .{e});
+            ssh_ok = false;
+        };
+
+        if (ssh_ok) {
+            var srv = ssh.Server.init(allocator, ssh_conf, &pool);
+            ssh_srv_ptr = try allocator.create(ssh.Server);
+            ssh_srv_ptr.?.* = srv;
+
+            ssh_thread = try std.Thread.spawn(.{}, struct {
+                fn run(s: *ssh.Server) void {
+                    s.listen() catch |e| {
+                        std.log.err("SSH server error: {}", .{e});
+                    };
+                }
+            }.run, .{ssh_srv_ptr.?});
+            ssh_thread.?.detach();
+
+            std.log.info("SSH server enabled on {s}:{d}", .{ cfg.ssh_host, cfg.ssh_port });
+        } else {
+            std.log.info("SSH server disabled due to failed preflight", .{});
+        }
+    } else {
+        std.log.info("SSH server disabled (set SSH_ENABLED=true to enable)", .{});
+    }
 
     log.info("HTTP server listening on http://{s}:{d}", .{ cfg.host, cfg.port });
 
@@ -126,8 +205,20 @@ pub fn main() !void {
         // Stop services
         cleanup_service.stop();
         watcher.stop();
+        if (ssh_srv_ptr) |s| {
+            s.stop();
+            s.deinit();
+            allocator.destroy(s);
+        }
         return err;
     };
+
+    // Graceful shutdown path
+    if (ssh_srv_ptr) |s| {
+        s.stop();
+        s.deinit();
+        allocator.destroy(s);
+    }
 }
 
 /// Server context passed to all request handlers
@@ -178,7 +269,6 @@ fn requestDispatch(ctx: *Context, req: *httpz.Request, res: *httpz.Response) boo
     };
     return true;
 }
-
 
 test {
     std.testing.refAllDecls(@This());

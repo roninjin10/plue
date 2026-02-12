@@ -235,7 +235,8 @@ pub fn configure(server: *httpz.Server(*Context)) !void {
 
     // Internal API routes - for runner pods (not exposed externally)
     router.post("/internal/runners/register", internal_routes.registerRunner, .{});
-    router.post("/internal/runners/:pod_name/heartbeat", internal_routes.runnerHeartbeat, .{});
+    // Heartbeat by runner id for consistency with DAO
+    router.post("/internal/runners/:runner_id/heartbeat", internal_routes.runnerHeartbeatId, .{});
     router.post("/internal/tasks/:task_id/stream", internal_routes.streamTaskEvent, .{});
     router.post("/internal/tasks/:task_id/complete", internal_routes.completeTask, .{});
 

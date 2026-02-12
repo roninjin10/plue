@@ -14,8 +14,9 @@
 
 const std = @import("std");
 const workflows = @import("workflows/mod.zig");
+const ssh_security = @import("ssh/security_log.zig");
 
-const db = @import(db);
+const db = @import("db");
 const log = std.log.scoped(.cli);
 
 // Simple writer wrappers for stdout/stderr using std.debug.print
@@ -507,8 +508,14 @@ fn connectDb(allocator: std.mem.Allocator) !*db.Pool {
 }
 
 fn executeSshAuthorizedKeys(allocator: std.mem.Allocator, writer: anytype, username: []const u8) !void {
-    // Only allow the dedicated git OS account
-    if (!std.mem.eql(u8, username, "git")) return;
+    // Allow only the configured login user. Precedence:
+    // SSH_AUTHORIZED_KEYS_USER > SSH_LOGIN_USER > "git"
+    const allowed_user = blk: {
+        if (std.posix.getenv("SSH_AUTHORIZED_KEYS_USER")) |v| break :blk v;
+        if (std.posix.getenv("SSH_LOGIN_USER")) |v| break :blk v;
+        break :blk "git";
+    };
+    if (!std.mem.eql(u8, username, allowed_user)) return;
 
     var pool = try connectDb(allocator);
     defer pool.deinit();
@@ -529,17 +536,22 @@ fn executeSshAuthorizedKeys(allocator: std.mem.Allocator, writer: anytype, usern
     defer result.deinit();
 
     const plue_bin = std.posix.getenv("PLUE_BIN");
-    const forced = blk: {
-        if (plue_bin) |p| break :blk p;
-        break :blk "plue";
-    };
+    // Arena for small string work
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const forced_raw = if (plue_bin) |p| p else "plue";
+
+    // Escape for inclusion inside a double-quoted authorized_keys command="..."
+    const forced = try escapeForDoubleQuotes(aa, forced_raw);
 
     while (try result.next()) |row| {
         const key_id = row.get(i64, 0);
         const public_key = row.get([]const u8, 1);
 
         try writer.print(
-            "command=\"{s} ssh serv key-{d}\",restrict,no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty {s}\n",
+            "command=\"{s} ssh serv key-{d}\",restrict,no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty,no-user-rc {s}\n",
             .{ forced, key_id, public_key },
         );
     }
@@ -549,17 +561,30 @@ fn executeSshAuthorizedKeys(allocator: std.mem.Allocator, writer: anytype, usern
 // SSH: Serv (ForcedCommand) - Authorization + Exec git-*-pack
 // =============================================================================
 
-const GitOp = enum { upload_pack, receive_pack };
+const GitOp = enum { upload_pack, receive_pack, upload_archive, lfs_download, lfs_upload };
 
 fn parseOriginalCommand(cmd: []const u8) !struct { op: GitOp, repo: []const u8 } {
     // Expected forms:
     //   git-upload-pack '/owner/repo.git'
-    //   git-receive-pack '/owner/repo.git'
+    //   git-receive-pack "/owner/repo.git"
+    //   git-lfs-authenticate '/owner/repo.git' (download|upload)
     var it = std.mem.tokenizeScalar(u8, cmd, ' ');
     const prog = it.next() orelse return error.InvalidCommand;
-    const arg = std.mem.trim(u8, it.next() orelse return error.InvalidCommand, "'\" ");
-    if (std.mem.eql(u8, prog, "git-upload-pack")) return .{ .op = .upload_pack, .repo = arg };
-    if (std.mem.eql(u8, prog, "git-receive-pack")) return .{ .op = .receive_pack, .repo = arg };
+
+    if (std.mem.eql(u8, prog, "git-upload-pack") or std.mem.eql(u8, prog, "git-receive-pack")) {
+        const arg = std.mem.trim(u8, it.next() orelse return error.InvalidCommand, "'\" ");
+        if (std.mem.eql(u8, prog, "git-upload-pack")) return .{ .op = .upload_pack, .repo = arg };
+        return .{ .op = .receive_pack, .repo = arg };
+    }
+
+    if (std.mem.eql(u8, prog, "git-lfs-authenticate")) {
+        const repo = std.mem.trim(u8, it.next() orelse return error.InvalidCommand, "'\" ");
+        const mode = it.next() orelse return error.InvalidCommand;
+        if (std.mem.eql(u8, mode, "download")) return .{ .op = .lfs_download, .repo = repo };
+        if (std.mem.eql(u8, mode, "upload")) return .{ .op = .lfs_upload, .repo = repo };
+        return error.InvalidCommand;
+    }
+
     return error.UnsupportedCommand;
 }
 
@@ -569,8 +594,17 @@ fn startsWithDir(parent: []const u8, child: []const u8) bool {
     return child[parent.len] == '/';
 }
 
+fn getClientIp() []const u8 {
+    // Prefer real client IP propagated by the bridge; fallback to SSH_CONNECTION parsing
+    if (std.posix.getenv("PLUE_REAL_CLIENT_IP")) |ip| {
+        if (ip.len > 0) return ip;
+    }
+    const sc = std.posix.getenv("SSH_CONNECTION") orelse "";
+    var it = std.mem.tokenizeScalar(u8, sc, ' ');
+    return it.next() orelse sc;
+}
+
 fn executeSshServ(allocator: std.mem.Allocator, writer: anytype, key_ctx: []const u8) !void {
-    _ = writer;
     // Extract key id from key-<id>
     var key_id: i64 = -1;
     if (std.mem.startsWith(u8, key_ctx, "key-")) {
@@ -579,7 +613,11 @@ fn executeSshServ(allocator: std.mem.Allocator, writer: anytype, key_ctx: []cons
     if (key_id <= 0) return error.InvalidKeyContext;
 
     const orig = std.posix.getenv("SSH_ORIGINAL_COMMAND") orelse return error.MissingOriginalCommand;
-    const parsed = parseOriginalCommand(orig) catch return error.InvalidCommand;
+    const parsed = parseOriginalCommand(orig) catch {
+        const ip_only = getClientIp();
+        ssh_security.logCommandRejected(ip_only, "git", orig, "invalid command");
+        return error.InvalidCommand;
+    };
 
     // Normalize repo path: strip leading slashes and .git suffix
     var repo_path = parsed.repo;
@@ -624,18 +662,25 @@ fn executeSshServ(allocator: std.mem.Allocator, writer: anytype, key_ctx: []cons
     const allowed = switch (op) {
         .upload_pack => can_read,
         .receive_pack => can_write,
+        .lfs_download => can_read,
+        .lfs_upload => can_write,
     };
     // Log decision
-    const client = std.posix.getenv("SSH_CONNECTION") orelse "";
+    const ip_only = getClientIp();
     std.log.info("ssh-serv key={d} client={s} repo={s}/{s} op={s} allow={}", .{
-        key_id, client, owner, name,
+        key_id, ip_only, owner, name,
         switch (op) {
             .upload_pack => "upload-pack",
             .receive_pack => "receive-pack",
+            .lfs_download => "lfs-download",
+            .lfs_upload => "lfs-upload",
         },
         allowed,
     });
-    if (!allowed) return error.AccessDenied;
+    if (!allowed) {
+        ssh_security.logCommandRejected(ip_only, "git", orig, "access denied");
+        return error.AccessDenied;
+    }
 
     // 4) Resolve filesystem path and prevent traversal
     const repos_dir = std.posix.getenv("PLUE_REPOS_DIR") orelse "/var/lib/plue/repos";
@@ -652,12 +697,45 @@ fn executeSshServ(allocator: std.mem.Allocator, writer: anytype, key_ctx: []cons
     defer aa.free(canon_target);
     if (!startsWithDir(canon_repos, canon_target)) return error.RepoPathTraversal;
 
-    // 5) Exec git-*-pack with inherited stdio
+    // 5) Handle LFS authenticate or exec git-*-pack
+    if (op == .lfs_download or op == .lfs_upload) {
+        // Construct LFS endpoint and headers
+        var arena_lfs = std.heap.ArenaAllocator.init(allocator);
+        defer arena_lfs.deinit();
+        const aalfs = arena_lfs.allocator();
+
+        const explicit_lfs_base = std.posix.getenv("PLUE_LFS_URL");
+        const http_base = std.posix.getenv("PLUE_HTTP_URL") orelse "http://localhost:4000";
+
+        const href = if (explicit_lfs_base) |b|
+            try std.fmt.allocPrint(aalfs, "{s}/{s}/{s}.git/info/lfs", .{ b, owner, name })
+        else
+            try std.fmt.allocPrint(aalfs, "{s}/{s}/{s}.git/info/lfs", .{ http_base, owner, name });
+
+        const token = std.posix.getenv("PLUE_LFS_TOKEN");
+
+        if (token) |t| {
+            try writer.print(
+                "{\"href\":\"{s}\",\"header\":{\"Authorization\":\"Bearer {s}\"}}\n",
+                .{ href, t },
+            );
+        } else {
+            try writer.print("{\"href\":\"{s}\",\"header\":{}}\n", .{ href });
+        }
+
+        ssh_security.logCommandExecuted(ip_only, "git-lfs", "git-lfs-authenticate");
+        ssh_security.logSessionClosed(ip_only, "git-lfs", 0);
+        return;
+    }
+
+    // Exec git-*-pack with inherited stdio
     const git_upload = std.posix.getenv("PLUE_GIT_UPLOAD_PACK") orelse "/usr/bin/git-upload-pack";
     const git_receive = std.posix.getenv("PLUE_GIT_RECEIVE_PACK") orelse "/usr/bin/git-receive-pack";
     const bin = switch (op) {
         .upload_pack => git_upload,
         .receive_pack => git_receive,
+        .lfs_download => git_upload, // unreachable due to early return
+        .lfs_upload => git_receive,
     };
 
     var child = std.process.Child.init(&.{ bin, canon_target }, allocator);
@@ -681,7 +759,12 @@ fn executeSshServ(allocator: std.mem.Allocator, writer: anytype, key_ctx: []cons
                     _ = http_child.spawnAndWait() catch {};
                 }
             }
-            // Propagate exit code
+            // Propagate exit code and log
+            if (code == 0) {
+                const cmd_name = switch (op) { .upload_pack => "git-upload-pack", .receive_pack => "git-receive-pack" };
+                ssh_security.logCommandExecuted(ip_only, "git", cmd_name);
+                ssh_security.logSessionClosed(ip_only, "git", 0);
+            }
             if (code != 0) return error.ExecFailed;
         },
         else => return error.ExecFailed,
@@ -734,4 +817,56 @@ test "parseArgs - unknown command" {
     const args = &[_][]const u8{ "plue", "foo" };
     const result = try parseArgs(allocator, args);
     try std.testing.expectEqual(Command.unknown, result.command);
+}
+
+test "parseOriginalCommand - upload" {
+    const p = try parseOriginalCommand("git-upload-pack '/alice/repo.git'");
+    try std.testing.expectEqual(GitOp.upload_pack, p.op);
+    try std.testing.expectEqualStrings("/alice/repo.git", p.repo);
+}
+
+test "parseOriginalCommand - receive double quotes" {
+    const p = try parseOriginalCommand("git-receive-pack \"/a/b.git\"");
+    try std.testing.expectEqual(GitOp.receive_pack, p.op);
+    try std.testing.expectEqualStrings("/a/b.git", p.repo);
+}
+
+test "parseOriginalCommand - lfs download" {
+    const p = try parseOriginalCommand("git-lfs-authenticate '/ow/n.git' download");
+    try std.testing.expectEqual(GitOp.lfs_download, p.op);
+    try std.testing.expectEqualStrings("/ow/n.git", p.repo);
+}
+
+test "parseOriginalCommand - lfs upload" {
+    const p = try parseOriginalCommand("git-lfs-authenticate '/ow/n.git' upload");
+    try std.testing.expectEqual(GitOp.lfs_upload, p.op);
+}
+
+test "parseOriginalCommand - invalid" {
+    try std.testing.expectError(error.InvalidCommand, parseOriginalCommand("git-upload-pack"));
+}
+
+test "parseOriginalCommand - unsupported" {
+    try std.testing.expectError(error.UnsupportedCommand, parseOriginalCommand("echo hi"));
+}
+
+// ---- helpers ----
+fn escapeForDoubleQuotes(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    var extra: usize = 0;
+    for (s) |c| {
+        if (c == '"' or c == '\\') {
+            extra += 1;
+        }
+    }
+    if (extra == 0) return allocator.dupe(u8, s);
+    var out = try allocator.alloc(u8, s.len + extra);
+    var j: usize = 0;
+    for (s) |c| {
+        if (c == '"' or c == '\\') {
+            out[j] = '\\';
+            j += 1;
+        }
+        out[j] = c; j += 1;
+    }
+    return out;
 }
