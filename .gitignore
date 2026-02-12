@@ -89,3 +89,10 @@ repos/
 playwright-report/
 test-results/
 playwright/.cache/
+
+# Smithers local runtime
+.smithers/
+
+# Wrangler / pnpm local state
+edge/.pnpm-store/
+edge/.wrangler/

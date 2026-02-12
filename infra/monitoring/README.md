@@ -201,7 +201,7 @@ Five MCP servers enable AI agents to query, debug, and analyze the system:
 | `plue_http_request_duration_ms` | Histogram | Request latency distribution |
 | `plue_auth_attempts_total` | Counter | Authentication attempts by result/method |
 | `plue_active_sessions` | Gauge | Current active user sessions |
-| `plue_active_websockets` | Gauge | Current WebSocket connections |
+| `plue_active_streams` | Gauge | Current active SSE streams |
 | `plue_active_pty_sessions` | Gauge | Current PTY sessions |
 | `plue_db_queries_total` | Counter | Total database queries |
 | `plue_db_query_errors_total` | Counter | Database query errors |

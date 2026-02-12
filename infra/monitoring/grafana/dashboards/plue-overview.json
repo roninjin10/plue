@@ -365,8 +365,8 @@
         },
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "plue_active_websockets",
-          "legendFormat": "Active WebSockets",
+          "expr": "plue_active_streams",
+          "legendFormat": "Active Streams",
           "refId": "B"
         }
       ],
