@@ -5,9 +5,20 @@
 # This script is used as ForceCommand in sshd_config
 
 set -euo pipefail
+# Optional key context from AuthorizedKeys forced command: key-<id>
+KEY_CTX="${1:-}"
+KEY_ID=""
+if [[ "$KEY_CTX" =~ ^key-([0-9]+)$ ]]; then
+  KEY_ID="${BASH_REMATCH[1]}"
+fi
 
-# Repository base directory
+
+# Repository base directory (configurable)
 REPOS_DIR="${PLUE_REPOS_DIR:-/var/lib/plue/repos}"
+
+# Git binaries (configurable)
+GIT_RECEIVE_PACK="${PLUE_GIT_RECEIVE_PACK:-/usr/bin/git-receive-pack}"
+GIT_UPLOAD_PACK="${PLUE_GIT_UPLOAD_PACK:-/usr/bin/git-upload-pack}"
 
 # Original SSH command
 COMMAND="$SSH_ORIGINAL_COMMAND"
@@ -16,8 +27,9 @@ COMMAND="$SSH_ORIGINAL_COMMAND"
 LOG_DIR="${PLUE_LOG_DIR:-/var/log/plue}"
 mkdir -p "$LOG_DIR"
 
-# Log the command
-echo "$(date -Iseconds) - $USER - $COMMAND" >> "$LOG_DIR/git-shell.log"
+# Log the command with key id (if available) and client address
+CLIENT_ADDR="${SSH_CONNECTION:-}"
+echo "$(date -Iseconds) key=${KEY_ID:-} user=$USER from=$CLIENT_ADDR cmd=$COMMAND" >> "$LOG_DIR/git-shell.log"
 
 # Parse command
 case "$COMMAND" in
@@ -32,16 +44,22 @@ case "$COMMAND" in
         # Remove .git suffix
         REPO_PATH="${REPO_PATH%.git}"
 
-        # Full path to repository
+        # Normalize and verify path stays within REPOS_DIR
         FULL_PATH="$REPOS_DIR/$REPO_PATH"
+        FULL_PATH_REAL=$(realpath -m "$FULL_PATH")
+        REPOS_DIR_REAL=$(realpath -m "$REPOS_DIR")
+        case "$FULL_PATH_REAL" in
+          "$REPOS_DIR_REAL"/*) ;;
+          *) echo "Error: Invalid repository path" >&2; exit 1 ;;
+        esac
 
-        if [ ! -d "$FULL_PATH" ]; then
+        if [ ! -d "$FULL_PATH_REAL" ]; then
             echo "Error: Repository not found: $REPO_PATH" >&2
             exit 1
         fi
 
         # Execute git-upload-pack
-        exec /usr/bin/git-upload-pack "$FULL_PATH"
+        exec "$GIT_UPLOAD_PACK" "$FULL_PATH_REAL"
         ;;
 
     git-receive-pack\ *)
@@ -55,16 +73,22 @@ case "$COMMAND" in
         # Remove .git suffix
         REPO_PATH="${REPO_PATH%.git}"
 
-        # Full path to repository
+        # Normalize and verify path stays within REPOS_DIR
         FULL_PATH="$REPOS_DIR/$REPO_PATH"
+        FULL_PATH_REAL=$(realpath -m "$FULL_PATH")
+        REPOS_DIR_REAL=$(realpath -m "$REPOS_DIR")
+        case "$FULL_PATH_REAL" in
+          "$REPOS_DIR_REAL"/*) ;;
+          *) echo "Error: Invalid repository path" >&2; exit 1 ;;
+        esac
 
-        if [ ! -d "$FULL_PATH" ]; then
+        if [ ! -d "$FULL_PATH_REAL" ]; then
             echo "Error: Repository not found: $REPO_PATH" >&2
             exit 1
         fi
 
         # Execute git-receive-pack
-        /usr/bin/git-receive-pack "$FULL_PATH"
+        "$GIT_RECEIVE_PACK" "$FULL_PATH_REAL"
         EXIT_CODE=$?
 
         # Trigger jj sync if push succeeded

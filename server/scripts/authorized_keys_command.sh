@@ -5,7 +5,7 @@
 # Usage: authorized_keys_command.sh <username>
 #
 # Configure in sshd_config:
-#   AuthorizedKeysCommand /path/to/authorized_keys_command.sh
+#   AuthorizedKeysCommand /opt/plue/scripts/authorized_keys_command.sh
 #   AuthorizedKeysCommandUser git
 #
 # Security considerations:
@@ -27,16 +27,7 @@ if [ "$USERNAME" != "git" ]; then
     exit 1
 fi
 
-# Database connection (set via environment or config)
-DATABASE_URL="${DATABASE_URL:-postgres://localhost/plue}"
-
-# Query database for all active users' public keys
-# Add security restrictions to each key
-psql "$DATABASE_URL" -t -A -c "
-    SELECT
-        'no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty ' || public_key
-    FROM ssh_keys k
-    JOIN users u ON k.user_id = u.id
-    WHERE u.is_active = true
-    ORDER BY k.id
-" 2>/dev/null || exit 1
+# Delegate to Zig CLI which queries the database and emits authorized_keys lines.
+# It also excludes users with prohibit_login = true and prefixes a per-key forced
+# command that calls `plue ssh serv key-<id>`.
+exec "${PLUE_BIN:-plue}" ssh authorized-keys "$USERNAME"

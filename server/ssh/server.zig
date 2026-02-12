@@ -18,6 +18,7 @@ const rate_limit = @import("rate_limit.zig");
 const connection_limit = @import("connection_limit.zig");
 const security_log = @import("security_log.zig");
 const health = @import("health.zig");
+const sshd_bridge = @import("sshd_bridge.zig");
 const db = @import("db");
 
 const log = std.log.scoped(.ssh_server);
@@ -32,6 +33,8 @@ pub const Config = struct {
     proxy_protocol_enabled: bool = true,
     /// Path to SSH host key (RSA)
     host_key_path: []const u8 = "data/ssh_host_key",
+    /// Path to SSH host key (Ed25519)
+    host_key_ed25519_path: []const u8 = "data/ssh_host_ed25519",
     /// Maximum concurrent connections total
     max_connections: u32 = 100,
     /// Maximum concurrent connections per IP
@@ -117,50 +120,50 @@ pub const Server = struct {
 
     /// Generate or load SSH host key
     fn ensureHostKey(self: *Server) !void {
-        // Check if host key exists
+        // Ensure RSA host key
         if (std.fs.cwd().access(self.config.host_key_path, .{})) {
-            log.info("Using existing SSH host key at {s}", .{self.config.host_key_path});
-            return;
+            log.info("Using existing SSH host RSA key at {s}", .{self.config.host_key_path});
         } else |_| {
-            // Need to generate host key
-            log.info("Generating SSH host key at {s}", .{self.config.host_key_path});
-
-            // Create directory if needed
+            log.info("Generating SSH host RSA key at {s}", .{self.config.host_key_path});
             if (std.fs.path.dirname(self.config.host_key_path)) |dir| {
                 try std.fs.cwd().makePath(dir);
             }
-
-            // Use ssh-keygen to generate RSA key
             var child = std.process.Child.init(&.{
-                "ssh-keygen",
-                "-t",
-                "rsa",
-                "-b",
-                "4096",
-                "-f",
-                self.config.host_key_path,
-                "-N",
-                "", // No passphrase
-                "-C",
+                "ssh-keygen",        "-t",                      "rsa", "-b", "4096",
+                "-f",                self.config.host_key_path, "-N",  "",   "-C",
                 "plue-ssh-host-key",
             }, self.allocator);
-
             child.stdout_behavior = .Ignore;
             child.stderr_behavior = .Ignore;
-
             const term = try child.spawnAndWait();
-
             switch (term) {
-                .Exited => |code| {
-                    if (code != 0) {
-                        log.err("ssh-keygen failed with code {d}", .{code});
-                        return error.KeyGenerationFailed;
-                    }
-                },
+                .Exited => |code| if (code != 0) return error.KeyGenerationFailed,
                 else => return error.KeyGenerationFailed,
             }
+            log.info("SSH host RSA key generated successfully", .{});
+        }
 
-            log.info("SSH host key generated successfully", .{});
+        // Ensure Ed25519 host key
+        if (std.fs.cwd().access(self.config.host_key_ed25519_path, .{})) {
+            log.info("Using existing SSH host Ed25519 key at {s}", .{self.config.host_key_ed25519_path});
+        } else |_| {
+            log.info("Generating SSH host Ed25519 key at {s}", .{self.config.host_key_ed25519_path});
+            if (std.fs.path.dirname(self.config.host_key_ed25519_path)) |dir2| {
+                try std.fs.cwd().makePath(dir2);
+            }
+            var child2 = std.process.Child.init(&.{
+                "ssh-keygen", "-t",                              "ed25519",
+                "-f",         self.config.host_key_ed25519_path, "-N",
+                "",           "-C",                              "plue-ssh-host-key",
+            }, self.allocator);
+            child2.stdout_behavior = .Ignore;
+            child2.stderr_behavior = .Ignore;
+            const term2 = try child2.spawnAndWait();
+            switch (term2) {
+                .Exited => |code| if (code != 0) return error.KeyGenerationFailed,
+                else => return error.KeyGenerationFailed,
+            }
+            log.info("SSH host Ed25519 key generated successfully", .{});
         }
     }
 
@@ -245,6 +248,7 @@ const Connection = struct {
     address: std.net.Address,
     /// Real client IP (from PROXY protocol, or same as address if direct)
     real_client_ip: ?[]const u8 = null,
+    real_client_ip_owned: bool = false,
     authenticated: bool = false,
     auth_user: ?types.AuthUser = null,
     /// Connection start time for duration tracking
@@ -255,7 +259,9 @@ const Connection = struct {
             allocator.free(user.username);
         }
         self.stream.close();
-        // Note: real_client_ip points into read buffer, no need to free
+        if (self.real_client_ip_owned) {
+            if (self.real_client_ip) |ip_slice| allocator.free(ip_slice);
+        }
     }
 
     /// Get the client IP for logging and rate limiting
@@ -329,92 +335,74 @@ fn handleConnectionInner(
     conn: *Connection,
     ip: []const u8,
 ) !void {
-    // Buffer for initial data (PROXY header + SSH version)
-    var initial_buf: [512]u8 = undefined;
-    var data_start: usize = 0;
+    // New path: immediately hand off to OpenSSH sshd (inetd mode),
+    // optionally parsing a PROXY header and forwarding leftover bytes.
+    {
+        var prebuffer: []const u8 = &.{};
+        if (server.config.proxy_protocol_enabled) {
+            var buf: [512]u8 = undefined;
+            var filled: usize = 0;
+            const cap = buf.len;
 
-    // Check for PROXY protocol header if enabled
-    if (server.config.proxy_protocol_enabled) {
-        // Read enough to detect and parse PROXY header
-        const bytes_read = conn.stream.read(&initial_buf) catch |err| {
-            log.err("Failed to read initial data: {}", .{err});
-            return err;
-        };
-
-        if (bytes_read == 0) {
-            log.info("Connection closed before sending data", .{});
-            return;
-        }
-
-        const data = initial_buf[0..bytes_read];
-
-        // Check if this is a PROXY protocol header
-        if (proxy_protocol.hasProxyHeader(data)) {
-            if (proxy_protocol.parseProxyProtocolV1(data)) |info| {
-                conn.real_client_ip = info.client_ip;
-                data_start = info.header_length;
-                log.info("PROXY protocol: real client {s}:{d}", .{
-                    info.client_ip,
-                    info.client_port,
-                });
-            } else {
-                log.warn("Invalid PROXY protocol header, treating as direct connection", .{});
+            // Initial read
+            const n0 = conn.stream.read(buf[0..]) catch |err| {
+                log.err("Failed to read initial data: {}", .{err});
+                return err;
+            };
+            if (n0 == 0) {
+                log.info("Connection closed before sending data", .{});
+                return;
             }
-        }
+            filled = n0;
+            var data = buf[0..filled];
 
-        // Process any remaining data after PROXY header (SSH version)
-        const remaining = data[data_start..];
-        if (remaining.len > 0) {
-            // Check if SSH version is already in the buffer
-            if (std.mem.indexOf(u8, remaining, "\r\n") != null or
-                std.mem.indexOf(u8, remaining, "\n") != null)
-            {
-                // Version is complete, validate it
-                if (!std.mem.startsWith(u8, remaining, "SSH-2.0-")) {
-                    log.err("Unsupported SSH version: {s}", .{remaining});
-                    return;
+            if (proxy_protocol.hasProxyHeader(data)) {
+                // Continue reading until CRLF or cap
+                while (proxy_protocol.parseProxyProtocolV1(data) == null and filled < cap) {
+                    const n = conn.stream.read(buf[filled..]) catch |err| {
+                        log.err("Failed while reading PROXY header: {}", .{err});
+                        return err;
+                    };
+                    if (n == 0) break;
+                    filled += n;
+                    data = buf[0..filled];
                 }
-                // Continue with protocol handling
+
+                if (proxy_protocol.parseProxyProtocolV1(data)) |info| {
+                    // Store a stable copy of client IP
+                    conn.real_client_ip = try server.allocator.dupe(u8, info.client_ip);
+                    conn.real_client_ip_owned = true;
+                    log.info("PROXY protocol: real client {s}:{d}", .{ info.client_ip, info.client_port });
+                    prebuffer = data[info.header_length..];
+                } else {
+                    log.warn("Invalid or incomplete PROXY header; closing connection to avoid corrupting SSH handshake", .{});
+                    return; // Do not forward partial header to sshd
+                }
+            } else {
+                prebuffer = data;
             }
+        } else {
+            // No PROXY protocol; do not pre-read further to avoid eating banner
+            prebuffer = &.{};
         }
-    }
 
-    // Send SSH version string
-    conn.stream.writeAll(types.SSH_VERSION ++ "\r\n") catch |err| {
-        log.err("Failed to send SSH version: {}", .{err});
-        return err;
-    };
-
-    // Read client version (if not already read from PROXY buffer)
-    var version_buf: [255]u8 = undefined;
-    const version = if (data_start > 0 and initial_buf[data_start] != 0)
-        // Version was in initial buffer after PROXY header
-        std.mem.sliceTo(initial_buf[data_start..], '\n')
-    else
-        // Need to read version separately
-        readLine(conn, &version_buf) catch |err| {
-            log.err("Failed to read client version: {}", .{err});
-            return err;
+        const env_ip = if (conn.real_client_ip) |rip| rip else ip;
+        sshd_bridge.spawnSshdBridge(
+            server.allocator,
+            conn.stream,
+            env_ip,
+            prebuffer,
+            server.config.host_key_path,
+            server.config.host_key_ed25519_path,
+        ) catch |e| {
+            log.err("sshd bridge failed: {}", .{e});
         };
-
-    log.info("Client version: {s}", .{version});
-
-    // Validate SSH-2.0
-    const version_trimmed = std.mem.trimRight(u8, version, "\r");
-    if (!std.mem.startsWith(u8, version_trimmed, "SSH-2.0-")) {
-        log.err("Unsupported SSH version: {s}", .{version});
-        return;
+        return; // Handled by sshd bridge
     }
-
-    // Handle protocol
-    handleProtocolSecure(server, conn, ip) catch |err| {
-        log.err("Protocol error: {}", .{err});
-    };
-
-    log.info("SSH connection closed from {s}", .{conn.getClientIp()});
+    // End of handleConnectionInner
 }
 
-/// Extract IP address from socket address
+// Extract IP address from socket address
 fn extractIpAddress(address: std.net.Address, buf: []u8) []const u8 {
     switch (address.any.family) {
         std.posix.AF.INET => {
@@ -428,9 +416,9 @@ fn extractIpAddress(address: std.net.Address, buf: []u8) []const u8 {
             // Simplified IPv6 formatting - use first 16 bytes
             const bytes = @as(*const [16]u8, @ptrCast(&address.in6.sa.addr));
             const result = std.fmt.bufPrint(buf, "{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}", .{
-                bytes[0], bytes[1], bytes[2], bytes[3],
-                bytes[4], bytes[5], bytes[6], bytes[7],
-                bytes[8], bytes[9], bytes[10], bytes[11],
+                bytes[0],  bytes[1],  bytes[2],  bytes[3],
+                bytes[4],  bytes[5],  bytes[6],  bytes[7],
+                bytes[8],  bytes[9],  bytes[10], bytes[11],
                 bytes[12], bytes[13], bytes[14], bytes[15],
             }) catch return "unknown";
             return result;
@@ -447,29 +435,10 @@ fn handleProtocolSecure(
     conn: *Connection,
     ip: []const u8,
 ) !void {
-    _ = conn;
-
-    // TODO: Implement full SSH protocol handling
-    // When authentication fails, record it:
-    // server.rate_limiter.recordAuthFailure(ip);
-    // security_log.logAuthFailure(.auth_failure_invalid_key, ip, username, "invalid key");
-    //
-    // When authentication succeeds:
-    // server.rate_limiter.recordAuthSuccess(ip);
-    // security_log.logAuthSuccess(ip, username, key_fingerprint);
-
-    log.warn("Full SSH protocol implementation is not yet complete", .{});
-    log.warn("Consider using one of these approaches:", .{});
-    log.warn("  1. Wrap OpenSSH sshd with authorized_keys_command", .{});
-    log.warn("  2. Use libssh2 with Zig bindings", .{});
-    log.warn("  3. Use MiSSHod pure Zig SSH library", .{});
-    log.warn("  4. Use ZSSH pure Zig SSH library", .{});
-
-    // For now, record this as an auth failure to demonstrate the security system
-    // In a real implementation, this would only happen on actual auth failures
+    // This function remains for future native implementation; currently unused.
     _ = server;
+    _ = conn;
     _ = ip;
-
     return error.NotImplemented;
 }
 

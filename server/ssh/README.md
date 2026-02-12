@@ -14,7 +14,7 @@ SSH server implementation for Git-over-SSH protocol. Provides authenticated Git 
 | `rate_limit.zig` | Connection rate limiting |
 | `connection_limit.zig` | Concurrent connection limits |
 | `security_log.zig` | Security event logging |
-| `proxy_protocol.zig` | PROXY protocol v2 support for load balancers |
+| `proxy_protocol.zig` | PROXY protocol v1 support for load balancers |
 
 ## Architecture
 
@@ -39,7 +39,7 @@ SSH server implementation for Git-over-SSH protocol. Provides authenticated Git 
 │  └──────────────┘    └──────────────┘    └──────────────┘  │
 │                                                             │
 │  ┌───────────────────────────────────────────────────────┐ │
-│  │              PROXY Protocol v2                        │ │
+│  │              PROXY Protocol v1                        │ │
 │  │                                                       │ │
 │  │  • Original client IP preservation                   │ │
 │  │  • Load balancer support                             │ │
@@ -121,3 +121,8 @@ Both commands:
 - Stream Git pack protocol
 - Update refs on successful push
 - Trigger webhooks/workflows on push
+
+## Notes
+
+- This server proxies the SSH protocol to OpenSSH (`sshd -i`) using a tight set of `-o` flags. Host key paths are taken from the Plue config and must be readable by the running user. Ensure file permissions are `0600` and ownership matches the process user, or set `StrictModes=no` during troubleshooting only.
+- PROXY Protocol: Only v1 is implemented. If you deploy behind Cloudflare Spectrum, enable the PROXY v1 option. Partial headers are read to completion (capped at 512 bytes) before forwarding any SSH bytes to avoid corrupting the handshake.

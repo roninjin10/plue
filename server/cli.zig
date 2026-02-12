@@ -15,6 +15,7 @@
 const std = @import("std");
 const workflows = @import("workflows/mod.zig");
 
+const db = @import(db);
 const log = std.log.scoped(.cli);
 
 // Simple writer wrappers for stdout/stderr using std.debug.print
@@ -66,7 +67,6 @@ const StderrWriter = struct {
     }
 };
 
-
 pub const Command = enum {
     workflow_list,
     workflow_run,
@@ -79,6 +79,9 @@ pub const Command = enum {
     prompt_test,
     help,
     unknown,
+    // SSH helpers (external-sshd integration)
+    ssh_authorized_keys,
+    ssh_serv,
 };
 
 pub const CliArgs = struct {
@@ -126,6 +129,13 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !CliArg
             const verb = rest[0];
             if (std.mem.eql(u8, verb, "preview")) break :blk .prompt_preview;
             if (std.mem.eql(u8, verb, "test")) break :blk .prompt_test;
+            break :blk .unknown;
+        } else if (std.mem.eql(u8, subcommand, "ssh")) {
+            // Subcommands: authorized-keys <username>, serv key-<id>
+            if (rest.len == 0) break :blk .help;
+            const verb = rest[0];
+            if (std.mem.eql(u8, verb, "authorized-keys")) break :blk .ssh_authorized_keys;
+            if (std.mem.eql(u8, verb, "serv")) break :blk .ssh_serv;
             break :blk .unknown;
         } else if (std.mem.eql(u8, subcommand, "help") or std.mem.eql(u8, subcommand, "--help") or std.mem.eql(u8, subcommand, "-h")) {
             break :blk .help;
@@ -259,6 +269,21 @@ pub fn execute(allocator: std.mem.Allocator, cli_args: CliArgs) !void {
             }
             const file_path = cli_args.args[1];
             try executePromptTest(allocator, stdout, file_path);
+        },
+        .ssh_authorized_keys => {
+            // Usage: plue ssh authorized-keys <username>
+            if (cli_args.args.len < 2) {
+                try stderr.writeAll("Error: username required\n");
+                try stderr.writeAll("Usage: plue ssh authorized-keys <username>\n");
+                return error.MissingArgument;
+            }
+            const username = cli_args.args[1];
+            try executeSshAuthorizedKeys(allocator, stdout, username);
+        },
+        .ssh_serv => {
+            // Usage: plue ssh serv key-<id>
+            const key_ctx: []const u8 = if (cli_args.args.len >= 2) cli_args.args[1] else "";
+            try executeSshServ(allocator, stdout, key_ctx);
         },
     }
 }
@@ -467,6 +492,200 @@ fn executePromptTest(allocator: std.mem.Allocator, writer: anytype, file_path: [
     try writer.writeAll("  1. Use the API: POST /api/prompts/test\n");
     try writer.writeAll("  2. Or use the web UI prompt editor\n");
     _ = allocator;
+}
+
+// =============================================================================
+// SSH: Authorized Keys Command
+// =============================================================================
+
+fn connectDb(allocator: std.mem.Allocator) !*db.Pool {
+    const url = std.posix.getenv("DATABASE_URL") orelse "postgresql://postgres:password@localhost:54321/plue?sslmode=disable";
+    const uri = try std.Uri.parse(url);
+    const pool = try allocator.create(db.Pool);
+    pool.* = try db.Pool.initUri(allocator, uri, .{ .size = 4, .timeout = 10_000 });
+    return pool;
+}
+
+fn executeSshAuthorizedKeys(allocator: std.mem.Allocator, writer: anytype, username: []const u8) !void {
+    // Only allow the dedicated git OS account
+    if (!std.mem.eql(u8, username, "git")) return;
+
+    var pool = try connectDb(allocator);
+    defer pool.deinit();
+
+    // Emit one line per active key with tight forced options and ForcedCommand to plue ssh serv key-<id>
+    // Note: we intentionally exclude users with prohibit_login = true
+    var conn = try pool.acquire();
+    defer conn.release();
+
+    var result = try conn.query(
+        \\SELECT k.id, k.public_key
+        \\FROM ssh_keys k
+        \\JOIN users u ON u.id = k.user_id
+        \\WHERE u.is_active = true
+        \\  AND u.prohibit_login = false
+        \\ORDER BY k.id
+    , .{});
+    defer result.deinit();
+
+    const plue_bin = std.posix.getenv("PLUE_BIN");
+    const forced = blk: {
+        if (plue_bin) |p| break :blk p;
+        break :blk "plue";
+    };
+
+    while (try result.next()) |row| {
+        const key_id = row.get(i64, 0);
+        const public_key = row.get([]const u8, 1);
+
+        try writer.print(
+            "command=\"{s} ssh serv key-{d}\",restrict,no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty {s}\n",
+            .{ forced, key_id, public_key },
+        );
+    }
+}
+
+// =============================================================================
+// SSH: Serv (ForcedCommand) - Authorization + Exec git-*-pack
+// =============================================================================
+
+const GitOp = enum { upload_pack, receive_pack };
+
+fn parseOriginalCommand(cmd: []const u8) !struct { op: GitOp, repo: []const u8 } {
+    // Expected forms:
+    //   git-upload-pack '/owner/repo.git'
+    //   git-receive-pack '/owner/repo.git'
+    var it = std.mem.tokenizeScalar(u8, cmd, ' ');
+    const prog = it.next() orelse return error.InvalidCommand;
+    const arg = std.mem.trim(u8, it.next() orelse return error.InvalidCommand, "'\" ");
+    if (std.mem.eql(u8, prog, "git-upload-pack")) return .{ .op = .upload_pack, .repo = arg };
+    if (std.mem.eql(u8, prog, "git-receive-pack")) return .{ .op = .receive_pack, .repo = arg };
+    return error.UnsupportedCommand;
+}
+
+fn startsWithDir(parent: []const u8, child: []const u8) bool {
+    if (!std.mem.startsWith(u8, child, parent)) return false;
+    if (child.len == parent.len) return true;
+    return child[parent.len] == '/';
+}
+
+fn executeSshServ(allocator: std.mem.Allocator, writer: anytype, key_ctx: []const u8) !void {
+    _ = writer;
+    // Extract key id from key-<id>
+    var key_id: i64 = -1;
+    if (std.mem.startsWith(u8, key_ctx, "key-")) {
+        key_id = std.fmt.parseInt(i64, key_ctx[4..], 10) catch -1;
+    }
+    if (key_id <= 0) return error.InvalidKeyContext;
+
+    const orig = std.posix.getenv("SSH_ORIGINAL_COMMAND") orelse return error.MissingOriginalCommand;
+    const parsed = parseOriginalCommand(orig) catch return error.InvalidCommand;
+
+    // Normalize repo path: strip leading slashes and .git suffix
+    var repo_path = parsed.repo;
+    while (repo_path.len > 0 and repo_path[0] == '/') repo_path = repo_path[1..];
+    if (std.mem.endsWith(u8, repo_path, ".git")) repo_path = repo_path[0 .. repo_path.len - 4];
+
+    // Expect exactly owner/repo
+    var parts = std.mem.splitScalar(u8, repo_path, '/');
+    const owner = parts.next() orelse return error.InvalidRepoPath;
+    const name = parts.next() orelse return error.InvalidRepoPath;
+    if (parts.next()) |_| return error.InvalidRepoPath; // too many segments
+
+    // DB lookups
+    var pool = try connectDb(allocator);
+    defer pool.deinit();
+
+    // 1) Resolve user who owns the key and ensure active/prohibit_login=false
+    var conn = try pool.acquire();
+    defer conn.release();
+
+    var row = try conn.row(
+        \\SELECT u.id::bigint, u.username, u.is_active, u.prohibit_login
+        \\FROM users u
+        \\JOIN ssh_keys k ON k.user_id = u.id
+        \\WHERE k.id = $1
+    , .{key_id});
+    if (row == null) return error.KeyNotFound;
+    const key_user_id = row.?.get(i64, 0);
+    const key_user_active = row.?.get(bool, 2);
+    const key_user_prohibit = row.?.get(bool, 3);
+    if (!key_user_active or key_user_prohibit) return error.UserNotAllowed;
+
+    // 2) Resolve repository owner/name and visibility
+    const repo = try db.getRepositoryByUserAndName(pool, owner, name) orelse return error.RepoNotFound;
+
+    // 3) Authorization
+    const op = parsed.op;
+    // Read rules: allowed if repo.is_public OR repo owner is key owner
+    const can_read = repo.is_public or (repo.user_id == key_user_id);
+    // Write rules: only owner for now (no collaborators yet)
+    const can_write = (repo.user_id == key_user_id);
+    const allowed = switch (op) {
+        .upload_pack => can_read,
+        .receive_pack => can_write,
+    };
+    // Log decision
+    const client = std.posix.getenv("SSH_CONNECTION") orelse "";
+    std.log.info("ssh-serv key={d} client={s} repo={s}/{s} op={s} allow={}", .{
+        key_id, client, owner, name,
+        switch (op) {
+            .upload_pack => "upload-pack",
+            .receive_pack => "receive-pack",
+        },
+        allowed,
+    });
+    if (!allowed) return error.AccessDenied;
+
+    // 4) Resolve filesystem path and prevent traversal
+    const repos_dir = std.posix.getenv("PLUE_REPOS_DIR") orelse "/var/lib/plue/repos";
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const target_rel = try std.fs.path.join(aa, &.{ owner, name });
+    const target = try std.fs.path.join(aa, &.{ repos_dir, target_rel });
+
+    const canon_repos = try std.fs.cwd().realpathAlloc(aa, repos_dir);
+    const canon_target = std.fs.cwd().realpathAlloc(aa, target) catch return error.RepoPathInvalid;
+    defer aa.free(canon_repos);
+    defer aa.free(canon_target);
+    if (!startsWithDir(canon_repos, canon_target)) return error.RepoPathTraversal;
+
+    // 5) Exec git-*-pack with inherited stdio
+    const git_upload = std.posix.getenv("PLUE_GIT_UPLOAD_PACK") orelse "/usr/bin/git-upload-pack";
+    const git_receive = std.posix.getenv("PLUE_GIT_RECEIVE_PACK") orelse "/usr/bin/git-receive-pack";
+    const bin = switch (op) {
+        .upload_pack => git_upload,
+        .receive_pack => git_receive,
+    };
+
+    var child = std.process.Child.init(&.{ bin, canon_target }, allocator);
+    child.stdin_behavior = .Inherit;
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
+    const term = try child.spawnAndWait();
+
+    switch (term) {
+        .Exited => |code| {
+            // On successful push, trigger JJ sync via HTTP if configured
+            if (code == 0 and op == .receive_pack) {
+                if (std.posix.getenv("PLUE_API_URL")) |api| {
+                    var http_child = std.process.Child.init(
+                        &.{ "curl", "-s", "-f", "-m", "5", try std.fmt.allocPrint(aa, "{s}/api/watcher/sync/{s}/{s}", .{ api, owner, name }) },
+                        allocator,
+                    );
+                    http_child.stdin_behavior = .Ignore;
+                    http_child.stdout_behavior = .Ignore;
+                    http_child.stderr_behavior = .Ignore;
+                    _ = http_child.spawnAndWait() catch {};
+                }
+            }
+            // Propagate exit code
+            if (code != 0) return error.ExecFailed;
+        },
+        else => return error.ExecFailed,
+    }
 }
 
 // ============================================================================

@@ -28,12 +28,14 @@ PasswordAuthentication no
 ChallengeResponseAuthentication no
 UsePAM no
 
-# Authorized keys command (queries Plue database)
+# Authorized keys command (queries Plue DB and prefixes per-key ForceCommand)
+# The script delegates to `plue ssh authorized-keys <username>` which emits
+# lines like: command="plue ssh serv key-<id>",restrict,... <public-key>
 AuthorizedKeysCommand /opt/plue/scripts/authorized_keys_command.sh
 AuthorizedKeysCommandUser git
 
-# Force command for git operations
-ForceCommand /opt/plue/scripts/git-shell.sh
+# Do NOT set a global ForceCommand here; each key line carries its own
+# forced command for strict per-key authorization.
 
 # Only allow 'git' user
 AllowUsers git

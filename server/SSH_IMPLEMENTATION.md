@@ -36,8 +36,10 @@ Located in `src/ssh/`, this is a native Zig implementation with the following co
 Located in `scripts/`, this approach leverages OpenSSH's `sshd` for protocol handling while implementing authentication and command execution in Plue.
 
 **Components**:
-- **`scripts/authorized_keys_command.sh`**: Queries database for authorized keys
-- **`scripts/git-shell.sh`**: Handles git commands with repository validation
+- **`scripts/authorized_keys_command.sh`**: Delegates to `plue ssh authorized-keys` for dynamic keys
+- **`plue ssh authorized-keys`**: Emits per-key forced command lines with restrictions
+- **`plue ssh serv`**: Serv-style authorization and execution of git-*-pack
+- **`scripts/git-shell.sh`**: Fallback restricted shell (kept for compatibility)
 - **`scripts/sshd_config.plue`**: Sample SSH server configuration
 
 ## Configuration
@@ -109,11 +111,13 @@ This starts the experimental SSH server on port 2222. Note: Full protocol implem
    sudo chown -R git:git /var/lib/plue /var/log/plue
    ```
 
-3. **Install scripts**:
+3. **Install CLI and scripts**:
    ```bash
    sudo mkdir -p /opt/plue/scripts
    sudo cp scripts/*.sh /opt/plue/scripts/
    sudo chmod +x /opt/plue/scripts/*.sh
+   sudo ln -sf /usr/local/bin/plue /opt/plue/plue || true
+   export PLUE_BIN=/opt/plue/plue
    ```
 
 4. **Generate host keys**:
@@ -203,7 +207,7 @@ git push origin main
 ssh -vvv git@localhost -p 2222
 
 # Check authorized keys command
-sudo -u git /opt/plue/scripts/authorized_keys_command.sh git
+sudo -u git /opt/plue/scripts/authorized_keys_command.sh git | head -5
 
 # View SSH logs
 sudo journalctl -u sshd -f
@@ -226,9 +230,8 @@ sudo tail -f /var/log/plue/git-shell.log
 - Check file permissions
 
 **"Access denied"**
-- Verify user has read/write access to repository
-- Check collaborators table for permissions
-- Ensure repository is not private (for read access)
+- `plue ssh serv` enforces: read requires public repo or ownership; write requires ownership.
+- Collaborator permissions are not implemented yet.
 
 ## Future Improvements
 

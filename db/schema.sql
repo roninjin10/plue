@@ -33,6 +33,21 @@ CREATE INDEX IF NOT EXISTS idx_users_lower_email ON users(lower_email);
 CREATE INDEX IF NOT EXISTS idx_users_is_active ON users(is_active);
 CREATE INDEX IF NOT EXISTS idx_users_wallet_address ON users(wallet_address);
 
+-- SSH public keys for Git-over-SSH authentication
+CREATE TABLE IF NOT EXISTS ssh_keys (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name VARCHAR(255) NOT NULL,
+  public_key TEXT NOT NULL,
+  fingerprint VARCHAR(255) NOT NULL UNIQUE,
+  key_type VARCHAR(32) NOT NULL DEFAULT 'user',
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_ssh_keys_user_id ON ssh_keys(user_id);
+CREATE INDEX IF NOT EXISTS idx_ssh_keys_fingerprint ON ssh_keys(fingerprint);
+
 -- Email addresses (supports multiple per user)
 CREATE TABLE IF NOT EXISTS email_addresses (
   id SERIAL PRIMARY KEY,
@@ -583,19 +598,6 @@ CREATE TABLE IF NOT EXISTS file_trackers (
 CREATE INDEX IF NOT EXISTS idx_file_trackers_session ON file_trackers(session_id);
 
 -- SSH Keys for Git over SSH authentication
-CREATE TABLE IF NOT EXISTS ssh_keys (
-  id SERIAL PRIMARY KEY,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  name VARCHAR(255) NOT NULL, -- User-defined key name
-  fingerprint VARCHAR(255) NOT NULL UNIQUE, -- SHA256:... fingerprint
-  public_key TEXT NOT NULL, -- Full public key content
-  key_type VARCHAR(32) NOT NULL DEFAULT 'user', -- 'user' or 'deploy'
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_ssh_keys_fingerprint ON ssh_keys(fingerprint);
-CREATE INDEX IF NOT EXISTS idx_ssh_keys_user_id ON ssh_keys(user_id);
 
 -- =============================================================================
 -- Workflow System Tables (New Python-based workflow system)

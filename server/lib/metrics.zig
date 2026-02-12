@@ -21,7 +21,7 @@ pub const Registry = struct {
 
     // Connection metrics
     active_sessions: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
-    active_websockets: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    active_streams: std.atomic.Value(i64) = std.atomic.Value(i64).init(0), // SSE streams
     active_pty_sessions: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
 
     // Database metrics
@@ -63,14 +63,14 @@ pub const Registry = struct {
         _ = self.active_sessions.fetchSub(1, .monotonic);
     }
 
-    /// Increment active websockets
-    pub fn websocketOpened(self: *Registry) void {
-        _ = self.active_websockets.fetchAdd(1, .monotonic);
+    /// Increment active SSE streams
+    pub fn streamOpened(self: *Registry) void {
+        _ = self.active_streams.fetchAdd(1, .monotonic);
     }
 
-    /// Decrement active websockets
-    pub fn websocketClosed(self: *Registry) void {
-        _ = self.active_websockets.fetchSub(1, .monotonic);
+    /// Decrement active SSE streams
+    pub fn streamClosed(self: *Registry) void {
+        _ = self.active_streams.fetchSub(1, .monotonic);
     }
 
     /// Increment active PTY sessions
@@ -146,16 +146,16 @@ pub const Registry = struct {
             \\# HELP plue_active_sessions Active user sessions
             \\# TYPE plue_active_sessions gauge
             \\plue_active_sessions {d}
-            \\# HELP plue_active_websockets Active WebSocket connections
-            \\# TYPE plue_active_websockets gauge
-            \\plue_active_websockets {d}
+            \\# HELP plue_active_streams Active SSE streams
+            \\# TYPE plue_active_streams gauge
+            \\plue_active_streams {d}
             \\# HELP plue_active_pty_sessions Active PTY sessions
             \\# TYPE plue_active_pty_sessions gauge
             \\plue_active_pty_sessions {d}
             \\
         , .{
             self.active_sessions.load(.monotonic),
-            self.active_websockets.load(.monotonic),
+            self.active_streams.load(.monotonic),
             self.active_pty_sessions.load(.monotonic),
         });
 

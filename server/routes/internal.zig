@@ -188,7 +188,9 @@ pub fn streamTaskEvent(ctx: *Context, req: *httpz.Request, res: *httpz.Response)
     };
 
     const run_id: i32 = task_id;
-    const session_id: ?[]const u8 = null;
+    // Resolve session_id for this run (used for SSE broadcasting)
+    const run_info_opt = db.workflows.getWorkflowRun(ctx.pool, run_id) catch null;
+    const session_id: ?[]const u8 = if (run_info_opt) |ri| ri.session_id else null;
 
     // Process event type and broadcast to WebSocket subscribers
     if (std.mem.eql(u8, event_type, "token") or std.mem.eql(u8, event_type, "llm_token")) {

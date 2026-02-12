@@ -4,7 +4,6 @@ const config = @import("config.zig");
 const db = @import("db");
 const metrics = @import("lib/metrics.zig");
 const routes = @import("routes.zig");
-const ssh = @import("ssh/server.zig");
 const middleware = @import("middleware/mod.zig");
 const repo_watcher = @import("services/repo_watcher.zig");
 const session_cleanup = @import("services/session_cleanup.zig");
@@ -60,11 +59,11 @@ pub fn main() !void {
 
     log.info("CSRF protection initialized", .{});
 
-    // Initialize agent WebSocket connection manager
+    // Initialize agent streaming connection manager (SSE-backed)
     var connection_manager = agent_handler.ConnectionManager.init(allocator);
     defer connection_manager.deinit();
 
-    log.info("Agent WebSocket connection manager initialized", .{});
+    log.info("Agent streaming manager initialized (SSE/WS)", .{});
 
     // Initialize edge notifier
     var edge_notify = edge_notifier.EdgeNotifier.init(allocator, cfg.edge_url, cfg.edge_push_secret);
@@ -122,52 +121,18 @@ pub fn main() !void {
 
     log.info("HTTP server listening on http://{s}:{d}", .{ cfg.host, cfg.port });
 
-    // Start SSH server if enabled
-    var ssh_server: ?ssh.Server = null;
-    var ssh_thread: ?std.Thread = null;
-
-    if (cfg.ssh_enabled) {
-        log.info("Starting SSH server on {s}:{d}", .{ cfg.ssh_host, cfg.ssh_port });
-
-        const ssh_config = ssh.Config{
-            .host = cfg.ssh_host,
-            .port = cfg.ssh_port,
-            .host_key_path = "data/ssh_host_key",
-        };
-
-        var server_instance = ssh.Server.init(allocator, ssh_config, pool);
-        ssh_server = server_instance;
-
-        // Start SSH server in separate thread
-        ssh_thread = try std.Thread.spawn(.{}, sshServerThread, .{&server_instance});
-
-        log.info("SSH server started successfully", .{});
-    } else {
-        log.info("SSH server disabled (set SSH_ENABLED=true to enable)", .{});
-    }
-
-    // Start HTTP server (blocking)
     server.listen() catch |err| {
         log.err("Server error: {}", .{err});
-
         // Stop services
         cleanup_service.stop();
         watcher.stop();
-
-        // Stop SSH server if running
-        if (ssh_server) |*ssh_srv| {
-            ssh_srv.stop();
-        }
-        if (ssh_thread) |thread| {
-            thread.join();
-        }
-
         return err;
     };
 }
 
 /// Server context passed to all request handlers
 pub const Context = struct {
+    pub const WebsocketHandler = agent_handler.WebsocketClient;
     allocator: std.mem.Allocator,
     pool: *db.Pool,
     config: config.Config,
@@ -214,12 +179,6 @@ fn requestDispatch(ctx: *Context, req: *httpz.Request, res: *httpz.Response) boo
     return true;
 }
 
-/// SSH server thread function
-fn sshServerThread(server: *ssh.Server) void {
-    server.listen() catch |err| {
-        log.err("SSH server error: {}", .{err});
-    };
-}
 
 test {
     std.testing.refAllDecls(@This());

@@ -6,8 +6,8 @@ Shell scripts and configuration for the Git-over-SSH server. Provides Git protoc
 
 | File | Purpose |
 |------|---------|
-| `authorized_keys_command.sh` | Dynamic SSH key lookup from database |
-| `git-shell.sh` | Restricted shell for Git operations |
+| `authorized_keys_command.sh` | Delegates to `plue ssh authorized-keys` |
+| `git-shell.sh` | Restricted shell for Git operations (fallback) |
 | `sshd_config.plue` | OpenSSH server configuration |
 | `git-shell-commands/` | Allowed Git commands directory |
 
@@ -59,14 +59,13 @@ Shell scripts and configuration for the Git-over-SSH server. Provides Git protoc
    $ git clone git@plue.app:owner/repo.git
 
 2. OpenSSH calls authorized_keys_command.sh
-   - Passes username and key fingerprint
-   - Script queries PostgreSQL for user's public keys
-   - Returns keys in authorized_keys format
+   - Passes username
+   - Script runs `plue ssh authorized-keys <username>`
+   - CLI queries PostgreSQL and prints forced-command lines
 
-3. If key matches, OpenSSH spawns git-shell.sh
-   - Sets restricted environment
-   - Only git-receive-pack and git-upload-pack allowed
-   - Repository access validated
+3. If key matches, OpenSSH runs forced command per key
+   - `plue ssh serv key-<id>` parses `$SSH_ORIGINAL_COMMAND`
+   - Validates repo + permissions, then executes git-*-pack
 
 4. Git protocol operations execute
    - Push: git-receive-pack

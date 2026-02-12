@@ -27,6 +27,7 @@ const httpz = @import("httpz");
 const Context = @import("../main.zig").Context;
 const db = @import("db");
 const json = @import("../lib/json.zig");
+const metrics = @import("../lib/metrics.zig");
 
 const log = std.log.scoped(.session_routes);
 
@@ -1316,6 +1317,7 @@ pub fn streamSession(ctx: *Context, req: *httpz.Request, res: *httpz.Response) !
     }
 
     log.info("Starting SSE stream for agent session: {s}", .{session_id});
+    metrics.global.streamOpened();
 
     // Set up SSE headers
     res.content_type = .EVENTS;
@@ -1333,8 +1335,91 @@ pub fn streamSession(ctx: *Context, req: *httpz.Request, res: *httpz.Response) !
     // Send initial connection event
     try writer.writeAll("event: connected\ndata: {\"type\":\"connected\"}\n\n");
 
-    // Keep connection alive with periodic keepalive comments
-    // In a real implementation, this would integrate with the agent execution
-    // For now, this just demonstrates the SSE format
+    // Establish SSE event loop: flush events from ConnectionManager
     log.info("SSE stream established for session: {s}", .{session_id});
+
+    var cursor: usize = 0;
+    // Immediately flush any buffered events (if any)
+    if (ctx.connection_manager) |cm| {
+        const fr = cm.flushSSE(session_id, writer, cursor);
+        cursor = fr.next_index;
+        if (fr.write_error) { metrics.global.streamClosed(); return; }
+        if (fr.terminal) { metrics.global.streamClosed(); return; }
+    }
+
+    // Main loop: low-latency polling + idle keepalive
+    var last_keepalive: i128 = std.time.nanoTimestamp();
+    const keepalive_ns: i128 = 20 * std.time.ns_per_s;
+    const tick_ns: u64 = 25 * std.time.ns_per_ms; // ~25ms cadence
+    while (true) {
+        if (ctx.connection_manager) |cm| {
+            if (cm.isAborted(session_id)) {
+                // Inform client the stream is aborted and exit
+                try writer.writeAll('event: aborted\ndata: {\type\\:\x07borted\\}\n\n');
+                metrics.global.streamClosed();
+                break;
+            }
+
+            // Flush any new events since cursor
+            const fr = cm.flushSSE(session_id, writer, cursor);
+            cursor = fr.next_index;
+            if (fr.write_error) { metrics.global.streamClosed(); break; }
+            if (fr.terminal) { metrics.global.streamClosed(); break; }
+
+            // Idle keepalive if no progress for ~20s
+            const now = std.time.nanoTimestamp();
+            if (now - last_keepalive >= keepalive_ns and fr.next_index == cursor) {
+                writer.writeAll(': keepalive\n\n') catch { metrics.global.streamClosed(); break; };
+                last_keepalive = now;
+            }
+        }
+
+        std.Thread.sleep(tick_ns);
+    }
+}
+/// WebSocket stream handler for agent session streaming
+/// GET /api/sessions/:sessionId/ws
+pub fn wsSession(ctx: *Context, req: *httpz.Request, res: *httpz.Response) !void {
+    const session_id = req.param("sessionId") orelse {
+        res.status = 400;
+        res.content_type = .TEXT;
+        try res.writer().writeAll("Missing session id");
+        return;
+    };
+
+    // Verify session exists
+    const session = db.getAgentSessionById(ctx.pool, session_id) catch {
+        res.status = 500;
+        res.content_type = .TEXT;
+        try res.writer().writeAll("Database error");
+        return;
+    };
+    if (session == null) {
+        res.status = 404;
+        res.content_type = .TEXT;
+        try res.writer().writeAll("Session not found");
+        return;
+    }
+
+    if (ctx.connection_manager) |manager| {
+        manager.clearAbort(session_id);
+        var ws_ctx = agent_handler.WebsocketClient.Context{
+            .manager = manager,
+            .session_id = session_id,
+            .allocator = ctx.allocator,
+        };
+        if (try httpz.upgradeWebsocket(agent_handler.WebsocketClient, req, res, &ws_ctx) == false) {
+            res.status = 400;
+            res.content_type = .TEXT;
+            res.body = "invalid websocket handshake";
+            return;
+        }
+        // unsafe to use req/res after successful upgrade
+        return;
+    } else {
+        res.status = 500;
+        res.content_type = .TEXT;
+        try res.writer().writeAll("Connection manager unavailable");
+        return;
+    }
 }
